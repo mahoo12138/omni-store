@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/omni-store/omnistore/internal/audit"
@@ -19,6 +20,7 @@ import (
 	"github.com/omni-store/omnistore/internal/files"
 	"github.com/omni-store/omnistore/internal/imagebed"
 	"github.com/omni-store/omnistore/internal/locks"
+	"github.com/omni-store/omnistore/internal/oidc"
 	"github.com/omni-store/omnistore/internal/operations"
 	"github.com/omni-store/omnistore/internal/publicdisk"
 	"github.com/omni-store/omnistore/internal/s3api"
@@ -33,28 +35,32 @@ import (
 
 // Server 聚合 HTTP 层依赖。
 type Server struct {
-	cfg            *config.Config
-	db             *sql.DB
-	logger         *slog.Logger
-	users          *users.Service
-	sources        *sources.Service
-	files          *files.Service
-	public         *publicdisk.Service
-	shares         *shares.Service
-	sessions       *auth.Sessions
-	loginLimiter   *auth.LoginLimiter
-	tokens         *auth.Tokens
-	imagebed       *imagebed.Service
-	anonLimiter    *imagebed.RateLimiter
-	capabilities   *capabilities.Service
-	staticassets   *staticassets.Service
-	operations     *operations.Service
-	audit          *audit.Logger
-	proxy          *security.ProxyResolver
-	s3Keys         *s3api.Credentials
-	s3Multipart    *s3api.MultipartStore
-	s3Handler      http.Handler
-	bootstrapToken string
+	cfg             *config.Config
+	db              *sql.DB
+	logger          *slog.Logger
+	users           *users.Service
+	sources         *sources.Service
+	files           *files.Service
+	public          *publicdisk.Service
+	shares          *shares.Service
+	sessions        *auth.Sessions
+	loginLimiter    *auth.LoginLimiter
+	tokens          *auth.Tokens
+	imagebed        *imagebed.Service
+	anonLimiter     *imagebed.RateLimiter
+	capabilities    *capabilities.Service
+	staticassets    *staticassets.Service
+	operations      *operations.Service
+	audit           *audit.Logger
+	proxy           *security.ProxyResolver
+	oidcSettings    *oidc.Settings
+	oidcMu          sync.Mutex
+	oidcClient      *oidc.Client
+	oidcFingerprint string
+	s3Keys          *s3api.Credentials
+	s3Multipart     *s3api.MultipartStore
+	s3Handler       http.Handler
+	bootstrapToken  string
 }
 
 // New 创建 HTTP Server，同时返回内部 Server 以便 main 启动后台任务。
@@ -109,6 +115,7 @@ func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server,
 		s.sources, s.files, s.imagebed,
 		auth.NewSessions(dbConn, time.Duration(cfg.Security.SessionTTLHours)*time.Hour),
 		multipartCleanupAdapter(s.s3Multipart))
+	s.oidcSettings = oidc.NewSettings(dbConn)
 
 	mux := http.NewServeMux()
 
@@ -125,11 +132,16 @@ func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server,
 	mux.HandleFunc("GET /api/v1/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("GET /api/v1/auth/me", s.requireAuth(s.handleMe))
 
+	// OIDC 单点登录（2.1.0，后端驱动 302 流程）
+	mux.HandleFunc("GET /api/v1/auth/oidc/login", s.handleOIDCLogin)
+	mux.HandleFunc("GET /api/v1/auth/oidc/callback", s.handleOIDCCallback)
+
 	// 用户自助
 	mux.HandleFunc("PATCH /api/v1/me/profile", s.requireAuth(s.handleUpdateProfile))
 	mux.HandleFunc("GET /api/v1/me/preferences", s.requireAuth(s.handleMyPreferences))
 	mux.HandleFunc("PATCH /api/v1/me/preferences", s.requireAuth(s.handleUpdatePreferences))
 	mux.HandleFunc("POST /api/v1/me/password", s.requireAuth(s.handleChangePassword))
+	mux.HandleFunc("POST /api/v1/me/oidc/unbind", s.requireAuth(s.handleUnbindMyOIDC))
 	mux.HandleFunc("GET /api/v1/me/activity", s.requireAuth(s.handleMyActivity))
 	mux.HandleFunc("GET /api/v1/me/recent-files", s.requireAuth(s.handleMyRecentFiles))
 	mux.HandleFunc("GET /api/v1/me/favorites", s.requireAuth(s.handleMyFavorites))
@@ -155,6 +167,7 @@ func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server,
 	mux.HandleFunc("POST /api/v1/admin/users/{id}/enable", s.requireAdmin(s.handleAdminSetUserDisabled(false)))
 	mux.HandleFunc("PATCH /api/v1/admin/users/{id}/quota", s.requireAdmin(s.handleAdminSetUserQuota))
 	mux.HandleFunc("POST /api/v1/admin/users/{id}/revoke-credentials", s.requireAdmin(s.handleAdminRevokeUserCredentials))
+	mux.HandleFunc("POST /api/v1/admin/users/{id}/unbind-oidc", s.requireAdmin(s.handleAdminUnbindOIDC))
 	mux.HandleFunc("DELETE /api/v1/admin/users/{id}", s.requireAdmin(s.handleAdminDeleteUser))
 
 	// 管理员：概览（dashboard 聚合数据）
@@ -284,6 +297,11 @@ func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server,
 	// 管理员：实例品牌信息（1.2.0）
 	mux.HandleFunc("GET /api/v1/admin/branding", s.requireAdmin(s.handleAdminGetBranding))
 	mux.HandleFunc("PUT /api/v1/admin/branding", s.requireAdmin(s.handleAdminSetBranding))
+
+	// 管理员：OIDC 单点登录配置（2.1.0）
+	mux.HandleFunc("GET /api/v1/admin/oidc", s.requireAdmin(s.handleAdminGetOIDC))
+	mux.HandleFunc("PUT /api/v1/admin/oidc", s.requireAdmin(s.handleAdminSetOIDC))
+	mux.HandleFunc("POST /api/v1/admin/oidc/test", s.requireAdmin(s.handleAdminTestOIDC))
 
 	// 管理员：手动导出系统配置包
 	mux.HandleFunc("GET /api/v1/admin/system/config-export", s.requireAdmin(s.handleAdminExportSystemConfig))

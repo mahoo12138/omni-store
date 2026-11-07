@@ -707,6 +707,12 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	u := CurrentUser(r.Context())
 
+	// SSO 建号账号没有本地密码可校验，提示去 IdP 修改而不是误导性报"旧密码错误"。
+	if has, err := s.users.HasPassword(u.ID); err == nil && !has {
+		WriteError(w, r, CodeForbidden, "当前账号通过 SSO 登录且未设置本地密码，请在身份提供方修改密码", nil)
+		return
+	}
+
 	hash, err := s.users.PasswordHashByID(u.ID)
 	if err != nil || !auth.VerifyPassword(hash, req.OldPassword) {
 		WriteError(w, r, CodeForbidden, "旧密码错误", nil)

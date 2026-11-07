@@ -26,6 +26,10 @@ var (
 	ErrQuotaInvalid = errors.New("用户配额不能为负数")
 	// ErrAlreadyInitialized 首个管理员已由另一请求创建。
 	ErrAlreadyInitialized = errors.New("系统已初始化")
+	// ErrOIDCIdentityTaken OIDC 身份已被其他账号绑定。
+	ErrOIDCIdentityTaken = errors.New("该 SSO 身份已绑定其他账号")
+	// ErrNoPassword 账号未设置本地密码（SSO 建号账号）。
+	ErrNoPassword = errors.New("账号未设置本地密码")
 )
 
 var usernameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,32}$`)
@@ -144,17 +148,134 @@ func prepareUser(username, displayName, password, role string) (string, string, 
 	return username, displayName, hash, nil
 }
 
-const userColumns = `id, user_public_id, username, display_name, role, is_disabled, quota_bytes, created_at, updated_at`
+// NormalizeOIDCUsername 将 IdP 的 preferred_username 清洗为本地用户名规则
+// （^[a-zA-Z0-9_-]{3,32}$）：非法字符替换为下划线并截断；清洗后仍不合法则报错。
+func NormalizeOIDCUsername(preferred string) (string, error) {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(preferred) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	username := b.String()
+	if len(username) > 32 {
+		username = username[:32]
+	}
+	username = strings.Trim(username, "_-")
+	if !usernameRe.MatchString(username) {
+		return "", ErrInvalidUsername
+	}
+	return username, nil
+}
+
+// GetByOIDCIdentity 查找绑定了给定 IdP 身份的用户。
+func (s *Service) GetByOIDCIdentity(issuer, subject string) (*models.User, error) {
+	return scanUser(s.db.QueryRow(`SELECT `+userColumns+` FROM users WHERE oidc_iss = ? AND oidc_sub = ?`, issuer, subject))
+}
+
+// BindOIDC 将 OIDC 身份绑定到指定用户。身份已被其他账号占用时返回
+// ErrOIDCIdentityTaken；并发绑定由 idx_users_oidc 唯一索引兜底。
+func (s *Service) BindOIDC(userID int64, issuer, subject string) error {
+	if subject == "" {
+		return fmt.Errorf("OIDC subject 不能为空")
+	}
+	res, err := s.db.Exec(`UPDATE users SET oidc_iss = ?, oidc_sub = ?, updated_at = ?
+	  WHERE id = ? AND NOT EXISTS (
+	    SELECT 1 FROM users WHERE oidc_iss = ? AND oidc_sub = ? AND id <> ?)`,
+		issuer, subject, time.Now().UTC(), userID, issuer, subject, userID)
+	if err != nil {
+		// SQLite 唯一约束报错携带列名而非索引名。
+		if strings.Contains(err.Error(), "users.oidc_iss") {
+			return ErrOIDCIdentityTaken
+		}
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := s.GetByID(userID); err != nil {
+			return err
+		}
+		return ErrOIDCIdentityTaken
+	}
+	return nil
+}
+
+// UnbindOIDC 解除用户的 OIDC 绑定。
+func (s *Service) UnbindOIDC(userID int64) error {
+	res, err := s.db.Exec(`UPDATE users SET oidc_iss = '', oidc_sub = '', updated_at = ? WHERE id = ?`,
+		time.Now().UTC(), userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CreateOIDCUser 由 IdP 身份（JIT）创建无密码本地账号：角色固定 user，
+// 密码哈希为空串使其天然无法通过密码登录。
+func (s *Service) CreateOIDCUser(username, displayName, email, issuer, subject string) (*models.User, error) {
+	username = strings.TrimSpace(username)
+	if !usernameRe.MatchString(username) {
+		return nil, ErrInvalidUsername
+	}
+	if displayName = strings.TrimSpace(displayName); displayName == "" {
+		displayName = username
+	}
+	email = strings.TrimSpace(email)
+
+	now := time.Now().UTC()
+	for range 5 {
+		publicID := auth.NewPublicID("u")
+		res, err := s.db.Exec(`INSERT INTO users
+	  (user_public_id, username, display_name, password_hash, role, is_disabled, email, oidc_iss, oidc_sub, created_at, updated_at)
+	  VALUES (?, ?, ?, '', ?, 0, ?, ?, ?, ?, ?)`,
+			publicID, username, displayName, models.RoleUser, email, issuer, subject, now, now)
+		if err != nil {
+			msg := err.Error()
+			if strings.Contains(msg, "users.username") {
+				return nil, ErrUsernameTaken
+			}
+			if strings.Contains(msg, "users.oidc_iss") {
+				return nil, ErrOIDCIdentityTaken
+			}
+			if strings.Contains(msg, "users.user_public_id") {
+				continue
+			}
+			return nil, fmt.Errorf("创建 SSO 用户失败: %w", err)
+		}
+		id, _ := res.LastInsertId()
+		return s.GetByID(id)
+	}
+	return nil, fmt.Errorf("生成 user_public_id 失败")
+}
+
+// HasPassword 返回账号是否设置了本地密码（SSO 建号账号为 false）。
+func (s *Service) HasPassword(id int64) (bool, error) {
+	var hash string
+	err := s.db.QueryRow(`SELECT password_hash FROM users WHERE id = ?`, id).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return hash != "", err
+}
+
+const userColumns = `id, user_public_id, username, display_name, role, is_disabled, quota_bytes, email, oidc_iss, oidc_sub, created_at, updated_at`
 
 func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
 	var u models.User
-	err := row.Scan(&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role, &u.IsDisabled, &u.QuotaBytes, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role, &u.IsDisabled, &u.QuotaBytes,
+		&u.Email, &u.OIDCIssuer, &u.OIDCSubject, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	u.SSOBound = u.OIDCSubject != ""
 	return &u, nil
 }
 

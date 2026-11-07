@@ -82,7 +82,7 @@ func TestCreatePackageIncludesSnapshotConfigAndKeys(t *testing.T) {
 	if len(m.Checksums) != len(m.Contents)-1 {
 		t.Fatalf("checksums=%v contents=%v", m.Checksums, m.Contents)
 	}
-	if m.DatabaseMaxMigration != "v2.0.0" {
+	if m.DatabaseMaxMigration != "v2.1.0" {
 		t.Fatalf("max migration=%q", m.DatabaseMaxMigration)
 	}
 	for _, state := range []string{

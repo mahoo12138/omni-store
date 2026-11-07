@@ -1,14 +1,15 @@
 import { useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { useNavigate } from '@tanstack/react-router'
-import { useQueryClient } from '@tanstack/react-query'
-import { login } from '../api/auth'
+import { useNavigate, useSearch } from '@tanstack/react-router'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { fetchAuthStatus, login } from '../api/auth'
+import { SSO_ERROR_MESSAGES } from '../api/sso'
 import { ApiRequestError } from '../api/client'
 import { Button } from '../components/ui/Button'
 import { Banner } from '../components/shell/Banner'
 import { FormField } from '../components/shell/FormLayout'
 import { Input } from '@fluentui/react-components'
-import { IconChevronRight, LogoMark } from '../components/ui/Icon'
+import { IconChevronRight, IconKey, LogoMark } from '../components/ui/Icon'
 import { AsciiTransfer } from '../components/login/AsciiTransfer'
 import { useStyles } from './AuthForm.styles'
 
@@ -17,10 +18,14 @@ export function LoginPage() {
   const cardRef = useRef<HTMLDivElement>(null)
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  // 回调失败时后端 302 到 /login?sso_error=<code>。
+  const search = useSearch({ strict: false }) as { sso_error?: string }
+  const authStatus = useQuery({ queryKey: ['auth-status'], queryFn: fetchAuthStatus, staleTime: 30_000 })
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const ssoError = search.sso_error ? SSO_ERROR_MESSAGES[search.sso_error] ?? 'SSO 登录失败，请重试。' : ''
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault()
@@ -53,6 +58,7 @@ export function LoginPage() {
           <div className={css.intro}>
             <h1 className={css.title}>登录到你的存储中心</h1>
           </div>
+          {ssoError && <Banner intent="error">{ssoError}</Banner>}
           <form className={css.form} onSubmit={onSubmit}>
             <FormField label="用户名">
               <Input
@@ -83,6 +89,18 @@ export function LoginPage() {
               {submitting ? '登录中…' : '登录'}
             </Button>
           </form>
+          {authStatus.data?.oidc_enabled && (
+            <div className={css.sso}>
+              <div className={css.ssoDivider} role="separator" aria-label="或使用单点登录">
+                <span>或</span>
+              </div>
+              {/* 整页跳转到后端发起端点，由后端驱动 302 完成 OIDC 流程。 */}
+              <a className={css.ssoButton} href="/api/v1/auth/oidc/login">
+                <IconKey size={16} />
+                使用 SSO 登录
+              </a>
+            </div>
+          )}
           <footer className={css.footer}>
             <a className={css.footerLink} href="/">返回公开网盘</a>
             <span className={css.footerMeta}>CLIENT → STORE → DELIVER</span>

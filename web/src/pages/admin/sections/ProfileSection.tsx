@@ -1,9 +1,11 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
+import { useNavigate, useSearch } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiRequestError } from '../../../api/client'
 import { changePassword, updateProfile } from '../../../api/admin'
 import { fetchMe } from '../../../api/auth'
+import { unbindMySso } from '../../../api/sso'
 import { createImageBedToken, deleteImageBedToken, fetchImageBedTokens, fetchTokenStatus, resetToken, type ImageBedToken } from '../../../api/imagebed'
 import { createS3Credential, deleteS3Credential, fetchS3Credentials, setS3CredentialDisabled, type S3Credential } from '../../../api/s3'
 import { fetchMySources } from '../../../api/sources'
@@ -11,9 +13,12 @@ import { Input, mergeClasses } from '@fluentui/react-components'
 import { Badge } from '../../../components/ui/Badge'
 import { Button } from '../../../components/ui/Button'
 import { DialogWrap } from '../../../components/ui/Dialog'
+import { ExternalLinkButton } from '../../../components/ui/LinkButton'
+import { Banner } from '../../../components/shell/Banner'
 import { FormField } from '../../../components/shell/FormLayout'
 import { StateView } from '../../../components/shell/StateView'
-import { IconChevronRight, IconCloud, IconImage, IconLink, IconPlus, IconTrash, IconWarning } from '../../../components/ui/Icon'
+import { toastSuccess } from '../../../components/ui/Toast'
+import { IconChevronRight, IconCloud, IconImage, IconKey, IconLink, IconPlus, IconTrash, IconWarning } from '../../../components/ui/Icon'
 import { formatDate } from '../../../utils/format'
 import { useStyles } from './profile.styles'
 import { SectionCard } from '../SectionCard'
@@ -44,19 +49,33 @@ type CredentialView = typeof credentialViews[number]['key']
 export function ProfileSection() {
   const css = useStyles()
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const search = useSearch({ strict: false }) as { sso_bound?: string }
+  const ssoBoundToastShown = useRef(false)
   const me = useQuery({ queryKey: ['me'], queryFn: fetchMe, retry: false })
   const tokens = useQuery({ queryKey: ['token-status'], queryFn: fetchTokenStatus })
   const s3Credentials = useQuery({ queryKey: ['s3-credentials'], queryFn: fetchS3Credentials })
 
   const [profileOpen, setProfileOpen] = useState(false)
   const [pwdOpen, setPwdOpen] = useState(false)
+  const [unbindSsoOpen, setUnbindSsoOpen] = useState(false)
   const [displayName, setDisplayName] = useState('')
   const [profileMsg, setProfileMsg] = useState('')
   const [oldPwd, setOldPwd] = useState('')
   const [newPwd, setNewPwd] = useState('')
   const [pwdMsg, setPwdMsg] = useState('')
+  const [unbindMsg, setUnbindMsg] = useState('')
   const [newTokens, setNewTokens] = useState<Record<string, string>>({})
   const [credentialView, setCredentialView] = useState<CredentialView | null>(null)
+
+  // 绑定流程从 IdP 回跳后带 ?sso_bound=1 落地，提示一次并清掉参数。
+  useEffect(() => {
+    if (search.sso_bound === '1' && !ssoBoundToastShown.current) {
+      ssoBoundToastShown.current = true
+      toastSuccess('SSO 身份绑定成功，下次可直接使用 SSO 登录。')
+      void navigate({ to: '/app/settings', search: { section: 'profile' }, replace: true })
+    }
+  }, [search.sso_bound, navigate])
 
   const profileMut = useMutation({
     mutationFn: updateProfile,
@@ -77,6 +96,18 @@ export function ProfileSection() {
       setTimeout(() => { setPwdOpen(false); setPwdMsg('') }, 600)
     },
     onError: (err) => setPwdMsg(err instanceof ApiRequestError ? err.message : '修改失败'),
+  })
+
+  const unbindSsoMut = useMutation({
+    mutationFn: (password: string) => unbindMySso(password),
+    onSuccess: async () => {
+      setUnbindSsoOpen(false)
+      setOldPwd('')
+      setUnbindMsg('')
+      await queryClient.invalidateQueries({ queryKey: ['me'] })
+      toastSuccess('已解除 SSO 绑定。')
+    },
+    onError: (err) => setUnbindMsg(err instanceof ApiRequestError ? err.message : '解除绑定失败'),
   })
 
   const resetMut = useMutation({
@@ -143,6 +174,12 @@ export function ProfileSection() {
               <span>@{me.data?.username ?? '-'}</span>
               <span className={css.metaDivider} aria-hidden="true" />
               <span>用户名不可修改</span>
+              {me.data?.sso_bound && (
+                <>
+                  <span className={css.metaDivider} aria-hidden="true" />
+                  <span><Badge color="green">SSO 已绑定</Badge></span>
+                </>
+              )}
             </p>
           </div>
         </div>
@@ -153,8 +190,32 @@ export function ProfileSection() {
           <Button variant="secondary" onClick={() => setPwdOpen(true)}>
             修改密码
           </Button>
+          {me.data?.sso_bound
+            ? <Button variant="dangerGhost" onClick={() => setUnbindSsoOpen(true)}>解除 SSO 绑定</Button>
+            : <ExternalLinkButton variant="secondary" icon={<IconKey size={16} />} href="/api/v1/auth/oidc/login?mode=bind">绑定 SSO 身份</ExternalLinkButton>}
         </div>
       </section>
+
+      {/* 解除 SSO 绑定确认 */}
+      <DialogWrap
+        open={unbindSsoOpen}
+        onOpenChange={(o) => { setUnbindSsoOpen(o); if (!o) setUnbindMsg('') }}
+        title="解除 SSO 绑定"
+        description="解除后该 IdP 身份将无法再登录本站；重新登录后可再次绑定。"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setUnbindSsoOpen(false)}>取消</Button>
+            <Button variant="danger" onClick={() => unbindSsoMut.mutate(oldPwd)} disabled={unbindSsoMut.isPending || !oldPwd}>
+              {unbindSsoMut.isPending ? '解除中…' : '解除绑定'}
+            </Button>
+          </>
+        }
+      >
+        <FormField label="当前密码" required info="为防止账号被冒用，解除绑定需确认当前登录密码。">
+          <Input type="password" value={oldPwd} onChange={(e) => setOldPwd(e.target.value)} autoFocus />
+        </FormField>
+        {unbindMsg ? <Banner intent="error">{unbindMsg}</Banner> : null}
+      </DialogWrap>
 
       {/* 修改显示名 弹窗 */}
       <DialogWrap

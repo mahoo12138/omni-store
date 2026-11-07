@@ -33,7 +33,7 @@ export function AdminOverviewPage({ mode }: { mode: 'settings' | 'admin' }) {
   const requestedSection = !isSettings && search.section === 'operations'
     ? 'stats'
     : legacySiteTab ? 'site' : search.section
-  const siteTab = search.tab === 'general' || legacySiteTab === 'general' ? 'general' : 'services'
+  const siteTab = search.tab === 'general' ? 'general' : search.tab === 'auth' ? 'auth' : 'services'
   const section: SectionKey = (nav.find((n) => n.key === requestedSection)?.key ??
     (isSettings ? 'profile' : 'stats')) as SectionKey
   const currentSection = nav.find((item) => item.key === section) ?? nav[0]

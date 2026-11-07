@@ -71,6 +71,7 @@ type systemStatusResponse struct {
 	Anonymous    systemStatusFlag `json:"anonymous"`
 	PublicDrive  systemStatusFlag `json:"public_drive"`
 	ImageBed     systemStatusFlag `json:"image_bed"`
+	SSO          systemStatusFlag `json:"sso"`
 	Version      string           `json:"version"`
 	PublicURL    string           `json:"public_url"`
 	InstanceName string           `json:"instance_name"`
@@ -118,6 +119,13 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	out.WebDAV.Enabled = true
 	out.WebDAV.Status = "已启用"
 	out.WebDAV.Hint = "WebDAV 服务运行正常，可正常连接"
+
+	// OIDC 单点登录（2.1.0）
+	if ssoEnabled := s.oidcEnabled(); ssoEnabled {
+		out.SSO = systemStatusFlag{Enabled: true, Status: "已启用", Hint: "支持通过 OIDC 单点登录（Casdoor）"}
+	} else {
+		out.SSO = systemStatusFlag{Status: "未启用", Hint: "管理员配置身份提供方后可使用 SSO 登录"}
+	}
 
 	// 文件预览服务
 	out.FilePreview.Enabled = true

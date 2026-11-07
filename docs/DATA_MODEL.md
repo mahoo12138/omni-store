@@ -18,6 +18,12 @@ v1.1.1.sql
 v2.0.0.sql
 ```
 
+2.1 新增：
+
+```text
+v2.1.0.sql
+```
+
 ## 1. storage_sources
 
 2.0 目标字段：
@@ -123,6 +129,23 @@ images 仍可对应 legacy path。新图床台账标记 `resource_scope=image_be
 - 其他小型实例设置。
 
 Capability -> Source 关系不得塞进 JSON/system_settings，使用外键表。
+
+## 6.1 users（2.1.0 追加列）
+
+```text
+email       TEXT NOT NULL DEFAULT ''
+oidc_iss    TEXT NOT NULL DEFAULT ''
+oidc_sub    TEXT NOT NULL DEFAULT ''
+```
+
+`oidc_sub` 空串表示未绑定（沿用本项目空串哨兵风格）；partial unique index
+`idx_users_oidc(oidc_iss, oidc_sub) WHERE oidc_sub != ''` 保证同一 IdP 身份至多绑定
+一个本地账号。SSO 建号（JIT）账号 `password_hash` 为空串，天然不能密码登录。
+API 序列化上 `oidc_iss`/`oidc_sub` 不出响应，仅暴露 `email` 与派生的 `sso_bound`。
+
+## 6.2 system_settings 新增键（2.1.0）
+
+- `oidc_config`：OIDC 单点登录配置 JSON（enabled/issuer/client_id/client_secret/scopes/auto_link_username/auto_create_users），见 [SSO 特性文档](features/sso.md)。
 
 ## 7. 按源静态 HTTP 配置
 

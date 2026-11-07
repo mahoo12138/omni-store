@@ -3,14 +3,17 @@ module github.com/omni-store/omnistore
 go 1.25.0
 
 require (
+	github.com/coreos/go-oidc/v3 v3.16.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/image v0.44.0
+	golang.org/x/oauth2 v0.30.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.53.0
 )
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

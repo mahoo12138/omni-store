@@ -67,7 +67,8 @@ func (s *Sessions) Validate(sessionID string) (*models.User, *models.Session, er
 	}
 	row := s.db.QueryRow(`SELECT
     s.session_id, s.user_id, s.csrf_token_hash, s.expires_at,
-    u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled, u.created_at, u.updated_at
+    u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled,
+    u.email, u.oidc_iss, u.oidc_sub, u.created_at, u.updated_at
   FROM sessions s JOIN users u ON u.id = s.user_id
   WHERE s.session_id = ?`, sessionID)
 
@@ -75,7 +76,8 @@ func (s *Sessions) Validate(sessionID string) (*models.User, *models.Session, er
 	var u models.User
 	err := row.Scan(
 		&sess.SessionID, &sess.UserID, &sess.CSRFTokenHash, &sess.ExpiresAt,
-		&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role, &u.IsDisabled, &u.CreatedAt, &u.UpdatedAt,
+		&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role, &u.IsDisabled,
+		&u.Email, &u.OIDCIssuer, &u.OIDCSubject, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrSessionInvalid
@@ -86,6 +88,7 @@ func (s *Sessions) Validate(sessionID string) (*models.User, *models.Session, er
 	if time.Now().UTC().After(sess.ExpiresAt) || u.IsDisabled {
 		return nil, nil, ErrSessionInvalid
 	}
+	u.SSOBound = u.OIDCSubject != ""
 
 	// 更新活跃时间，失败不影响本次请求。
 	_, _ = s.db.Exec(`UPDATE sessions SET last_seen_at = ? WHERE session_id = ?`,

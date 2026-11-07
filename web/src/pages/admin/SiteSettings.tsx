@@ -19,10 +19,11 @@ import { FormField, FormLayout } from '../../components/shell/FormLayout'
 import { IconCloud, IconDownload, IconGlobe, IconImage, IconInfo, IconTag } from '../../components/ui/Icon'
 import { Select } from '../../components/ui/Select'
 import { useStyles } from './sections/site.styles'
+import { SsoSection } from './sections/SsoSection'
 import { useStyles as useSiteStyles } from './SiteSettings.styles'
 import { SectionCard } from './SectionCard'
 
-type SiteTab = 'services' | 'general'
+type SiteTab = 'services' | 'general' | 'auth'
 const siteServices: { key: SiteCapability; name: string; bindingHint: string; icon: ReactElement }[] = [
   {
     key: 'public_drive', name: '公开网盘', icon: <IconGlobe size={18} />,
@@ -43,6 +44,7 @@ export function SiteSettingsSection({ tab, onTabChange }: { tab: SiteTab; onTabC
         <Tabs.List aria-label="站点配置">
           <Tabs.Tab value="services">站点服务</Tabs.Tab>
           <Tabs.Tab value="general">通用配置</Tabs.Tab>
+          <Tabs.Tab value="auth">认证</Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="services"><div className={site.panelBody}><SiteServicesSection /></div></Tabs.Panel>
         <Tabs.Panel value="general">
@@ -50,6 +52,11 @@ export function SiteSettingsSection({ tab, onTabChange }: { tab: SiteTab; onTabC
             <BrandingSection />
             <SiteRuntimeSection />
             <BackupSection />
+          </div>
+        </Tabs.Panel>
+        <Tabs.Panel value="auth">
+          <div className={site.panelBody}>
+            <SsoSection />
           </div>
         </Tabs.Panel>
       </Tabs.Root>

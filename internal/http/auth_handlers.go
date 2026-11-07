@@ -103,23 +103,24 @@ func (s *Server) handleSetupAdmin(w http.ResponseWriter, r *http.Request) {
 
 // handleAuthStatus 供公开页面无副作用地判断当前浏览器是否已登录。
 // 未登录和会话过期都返回 200，避免公开页面为了渲染入口制造 401 控制台噪声。
+// oidc_enabled 供登录页决定是否展示 SSO 登录入口。
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	cookie, err := r.Cookie(auth.SessionCookieName)
 	if err != nil {
-		WriteData(w, r, map[string]any{"authenticated": false})
+		WriteData(w, r, map[string]any{"authenticated": false, "oidc_enabled": s.oidcEnabled()})
 		return
 	}
 	if _, _, err := s.sessions.Validate(cookie.Value); err != nil {
 		if errors.Is(err, auth.ErrSessionInvalid) {
 			s.clearSessionCookie(w)
-			WriteData(w, r, map[string]any{"authenticated": false})
+			WriteData(w, r, map[string]any{"authenticated": false, "oidc_enabled": s.oidcEnabled()})
 			return
 		}
 		WriteError(w, r, CodeInternalError, "查询登录状态失败", nil)
 		return
 	}
-	WriteData(w, r, map[string]any{"authenticated": true})
+	WriteData(w, r, map[string]any{"authenticated": true, "oidc_enabled": s.oidcEnabled()})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {

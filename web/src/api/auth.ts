@@ -8,6 +8,9 @@ export interface User {
   role: 'super_admin' | 'user'
   is_disabled: boolean
   quota_bytes: number
+  email?: string
+  /** 是否已绑定 SSO（OIDC）身份 */
+  sso_bound?: boolean
   created_at: string
   updated_at: string
 }
@@ -34,7 +37,13 @@ export async function fetchMe(): Promise<User> {
   return data.user
 }
 
-export async function fetchAuthStatus(): Promise<{ authenticated: boolean }> {
+export interface AuthStatus {
+  authenticated: boolean
+  /** SSO 是否启用：登录页据此展示 SSO 登录入口 */
+  oidc_enabled?: boolean
+}
+
+export async function fetchAuthStatus(): Promise<AuthStatus> {
   return apiFetch('/api/v1/auth/status')
 }
 

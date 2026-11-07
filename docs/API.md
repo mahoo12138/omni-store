@@ -233,3 +233,21 @@ PATCH /api/v1/me/preferences
 返回 `data = { theme, updated_at }`。账号从未设置过偏好时 GET 返回 `{ "theme": "system" }` 且 `updated_at` 为空，读操作不建库记录。
 
 偏好是**账号级**外观选择，只覆盖登录用户；匿名访客与冷启动阶段的取值由前端本地存储提供，见 [设计系统](DESIGN_SYSTEM.md) 的主题条款。
+
+## 15. OIDC 单点登录（2.1.0）
+
+协议细节、配置项与用户映射规则见 [SSO 特性文档](features/sso.md)。
+
+```http
+GET  /api/v1/auth/oidc/login[?mode=bind]     # 免鉴权；302 到 IdP 授权页（bind 需已登录）
+GET  /api/v1/auth/oidc/callback              # 免鉴权；IdP 回调，成功 302 /app（bind 回 /app/settings?section=profile&sso_bound=1）
+GET  /api/v1/admin/oidc                      # 管理员读取 SSO 配置（client_secret 不回传，仅 has_secret）
+PUT  /api/v1/admin/oidc                      # 管理员保存配置；client_secret 留空表示保留原值
+POST /api/v1/admin/oidc/test                 # 管理员对 issuer 做 discovery 连通性检查（可测未保存的表单值）
+POST /api/v1/me/oidc/unbind                  # 登录用户自助解绑，body {"password"}；未设本地密码账号拒绝
+POST /api/v1/admin/users/{id}/unbind-oidc    # 管理员强制解绑
+```
+
+`GET /api/v1/auth/status` 增加 `oidc_enabled`；`GET /api/v1/system/status` 增加 `sso: {enabled, status, hint}`。`GET /api/v1/auth/me` 的 `user` 增加 `email`、`sso_bound`（`oidc_iss`/`oidc_sub` 不出任何 API 响应）。
+
+回调失败统一 302 `/login?sso_error=<code>`，code 取值：`oidc_disabled`、`oidc_not_configured`、`oidc_state_mismatch`、`oidc_provider_denied`、`oidc_exchange_failed`、`oidc_identity_unbound`、`oidc_identity_taken`、`oidc_username_invalid`、`oidc_username_conflict`、`oidc_account_disabled`、`oidc_bind_requires_login`、`oidc_rate_limited`、`oidc_internal`。这些码不是 HTTP API 错误码，仅供前端登录页展示中文提示。
