@@ -162,3 +162,12 @@ Web 端新增公开入口 `/transfer`（发送文件/收集文件/收发记录�
 - `OMNISTORE_CRASH_ROUNDS=10 ./scripts/verify-crash-recovery.sh` 通过：9 条场景共 90 次真实 SIGKILL。
 - 真实客户端矩阵剩余缺口同 [兼容矩阵](design/compatibility-testing.md)：Windows Explorer/Finder/rclone/Cyberduck/WinSCP/RaiDrive/Mountain Duck、AWS CLI/rclone S3/s3cmd/MinIO Client、PicGo，以及 MP4、Safari/Firefox 与生产反向代理仍未实测；Chromium 基础场景已于 2026-10-18 记录通过。本条目如实记录缺口，不声称已完成。
 - 随后推送 `main` 与标签 `v2.0.0`，由 GitHub Actions 完成质量门禁、Docker 镜像、Linux 二进制与 GitHub Release 发布。
+
+## 2026-11-08：2.0.0 正式版发布
+
+- 发布提交 `b0a9ba5`，包含两个 Linux CI E2E 稳定性修复：policy 用例改为在种子策略上验证规则 CRUD（权限引擎跨策略取最高权限，另一条策略的只读规则压不过种子策略的源级读写）；paste-conflict 用例的回收站清理改走 API（UI 清理在慢环境偶发超时）。
+- 标签 `v2.0.0` 曾两次随门禁失败重打（682f7c0 门禁失败于 policy 用例 → f254d3d 修复；重打后失败于 file-operations 清理 → b0a9ba5 修复；第三次全绿）。两次失败均未产出镜像、二进制或 Release，标签移动不涉及任何已发布产物。
+- GitHub Actions 质量门禁、Docker 镜像（ghcr.io，正式版附带 latest 标签）、Linux amd64/arm64 二进制与 GitHub Release 全部成功。
+- Release: https://github.com/mahoo12138/omni-store/releases/tag/v2.0.0；资产为 `checksums.txt` 与两个 Linux tar.gz。
+- 真实客户端矩阵剩余缺口同 [兼容矩阵](design/compatibility-testing.md)：Windows Explorer/Finder/rclone/Cyberduck/WinSCP/RaiDrive/Mountain Duck、AWS CLI/rclone S3/s3cmd/MinIO Client、PicGo，以及 MP4、Safari/Firefox 与生产反向代理仍未实测。
+- 后续 2.1 功能（OIDC 单点登录）已在 main 开发，未随 2.0.0 发布。
