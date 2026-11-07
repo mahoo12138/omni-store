@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-07
+
 ### Added
 
 - 统一文件预览（1.2.0 Preview Resolver）：文件管理器与分享页共用同一套渲染器，首批支持图片、文本、Markdown、JSON/YAML、代码、PDF、音频和视频；音视频基于标准 HTTP Range 与浏览器原生播放，无服务端转码。
