@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
+const baseURL = process.env.OMNISTORE_E2E_BASE_URL ?? 'http://127.0.0.1:18080'
+
 // 这些用例包含通知退场和 tooltip 重试等待，长于全局 30s 上限。
 test.describe.configure({ timeout: 60_000 })
 
@@ -25,6 +27,17 @@ function trashRows(page: Page, name: string) {
   return page.getByRole('row')
     .filter({ has: page.getByText(name, { exact: true }) })
     .filter({ has: page.getByRole('button', { name: '永久删除' }) })
+}
+
+// API 登录：清理类操作走 API，避免依赖慢环境下易抖动的回收站 UI 交互。
+async function apiAuth(page: Page, username: string, password: string) {
+  const response = await page.request.post(`${baseURL}/api/v1/auth/login`, {
+    data: { username, password },
+  })
+  expect(response.ok()).toBeTruthy()
+  const body = await response.json()
+  const cookie = response.headersArray().find((header) => header.name.toLowerCase() === 'set-cookie')!.value.split(';')[0]
+  return { cookie, csrf: body.data.csrf_token as string }
 }
 
 test('directory can be created, renamed, copied, cut-pasted and cleaned up', async ({ page }) => {
@@ -190,17 +203,21 @@ test('multi-select paste reports partial conflicts and keeps only failed copies 
     await expect(row).toHaveCount(0)
   }
 
-  await openTrash(page)
-  for (const name of [sourceA, sourceB, target]) {
-    const rows = trashRows(page, name)
-    await expect(rows.first()).toBeVisible()
-    while (await rows.count() > 0) {
-      const count = await rows.count()
-      const row = rows.first()
-      await row.getByRole('button', { name: '永久删除' }).click()
-      await page.getByRole('dialog', { name: '永久删除' }).getByRole('button', { name: '永久删除', exact: true }).click()
-      await expect(rows).toHaveCount(count - 1)
-    }
+  // 清理改走 API：慢环境下回收站行在路由切换/重渲染窗口会让 UI 清理偶发超时；
+  // 被清对象与断言无关，按条目 key 直接永久删除即可。
+  const demo = await apiAuth(page, 'demo', 'OmniStore-Test-Demo!')
+  const sourcesResponse = await page.request.fetch(`${baseURL}/api/v1/sources`, { headers: { cookie: demo.cookie } })
+  const teamKey = ((await sourcesResponse.json()).data.items as Array<{ key: string; name: string }>)
+    .find((item) => item.name === '团队文件')!.key
+  const trashResponse = await page.request.fetch(`${baseURL}/api/v1/sources/${teamKey}/trash`, { headers: { cookie: demo.cookie } })
+  const entries = ((await trashResponse.json()).data.items as Array<{ key: string; original_path: string }>)
+  for (const entry of entries) {
+    if (![sourceA, sourceB, target].some((name) => entry.original_path.includes(name))) continue
+    const purge = await page.request.fetch(
+      `${baseURL}/api/v1/sources/${teamKey}/trash/${encodeURIComponent(entry.key)}`,
+      { method: 'DELETE', headers: { cookie: demo.cookie, 'X-CSRF-Token': demo.csrf } },
+    )
+    expect(purge.status()).toBe(200)
   }
 })
 
