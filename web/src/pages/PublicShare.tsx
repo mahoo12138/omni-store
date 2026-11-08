@@ -11,7 +11,7 @@ import {
   type PublicShareInfo,
 } from '../api/shares'
 import { PublicFrame } from '../components/shell/PublicFrame'
-import { FileTable } from '../components/files/FileTable'
+import { FileTable, guessType } from '../components/files/FileTable'
 import { Button } from '../components/ui/Button'
 import { ExternalLinkButton, LinkButton } from '../components/ui/LinkButton'
 import { Tooltip } from '../components/ui/Tooltip'
@@ -21,7 +21,7 @@ import { Image, Input } from '@fluentui/react-components'
 import { PreviewModal } from '../preview/PreviewModal'
 import { PreviewContent, type PreviewItem } from '../preview/PreviewContent'
 import { resolvePreview } from '../preview/resolver'
-import { IconDownload, IconFile, IconFolder, IconGrid, IconImage, IconKey, IconList } from '../components/ui/Icon'
+import { EntryIcon, IconDownload, IconFolder, IconGrid, IconImage, IconKey, IconList } from '../components/ui/Icon'
 import { formatDate } from '../utils/format'
 import { useStyles as useFtStyles } from '../components/files/FileTable.styles'
 import { useStyles } from './PublicShare.styles'
@@ -139,15 +139,43 @@ function ShareStatus({
 }
 
 // —— 文件分享：按统一预览类型内嵌展示（图片/PDF/文本/音视频），不支持则仅下载 ——
+// 不可预览时身份块升格为居中舞台：类型砖 + 全名 + meta + 下载就是页面主体，
+// 剩余视口成为主体周围的负空间，而不是顶部一行加死白。
 function PublicFile({ shareKey, info }: { shareKey: string; info: PublicShareInfo }) {
   const css = useStyles()
+  const remaining = shareRemaining(info)
+  const previewable = resolvePreview({ name: info.name, size: info.size }) !== 'unsupported'
+
+  if (!previewable) {
+    return (
+      <PublicFrame>
+        <div className={css.stage}>
+          <div className={css.stageInner}>
+            <EntryIcon name={info.name} type="file" size={96} />
+            <h1 className={css.stageTitle}>{info.name}</h1>
+            <div className={css.stageMeta}>
+              <span>{guessType(info.name)}</span>
+              {info.size != null ? <span>{formatShareSize(info.size)}</span> : null}
+              <span>{info.expires_at ? `有效至 ${formatDate(info.expires_at)}` : '长期有效'}</span>
+              {remaining !== null ? <span>剩余 {remaining} / {info.max_downloads} 次下载</span> : null}
+            </div>
+            <ExternalLinkButton
+              size="large"
+              href={publicShareRawUrl(shareKey, '', true)}
+              icon={<IconDownload size={18} />}
+            >下载文件</ExternalLinkButton>
+          </div>
+        </div>
+      </PublicFrame>
+    )
+  }
+
   const item: PreviewItem = {
     name: info.name,
     size: info.size ?? null,
     url: publicShareRawUrl(shareKey, ''),
     downloadUrl: publicShareRawUrl(shareKey, '', true),
   }
-  const previewable = resolvePreview({ name: info.name, size: info.size }) !== 'unsupported'
   return (
     <PublicFrame>
       <ShareHero info={info}>
@@ -156,11 +184,9 @@ function PublicFile({ shareKey, info }: { shareKey: string; info: PublicShareInf
           icon={<IconDownload size={16} />}
         >下载文件</ExternalLinkButton>
       </ShareHero>
-      {previewable ? (
-        <div className={css.embedPreview}>
-          <PreviewContent item={item} />
-        </div>
-      ) : null}
+      <div className={css.embedPreview}>
+        <PreviewContent item={item} />
+      </div>
     </PublicFrame>
   )
 }
@@ -183,7 +209,7 @@ function PublicDirectory({ shareKey, info, path, page }: { shareKey: string; inf
     () => entries.filter((entry) => entry.type === 'file' && resolvePreview({ name: entry.name, size: entry.size }) === 'image'),
     [entries],
   )
-  const remaining = info.max_downloads > 0 ? Math.max(0, info.max_downloads - info.download_count) : null
+  const remaining = shareRemaining(info)
 
   // 切换目录时回到列表视图，画廊只对含图片的目录开放。
   useEffect(() => { setView('list') }, [path])
@@ -343,24 +369,28 @@ function PublicDirectory({ shareKey, info, path, page }: { shareKey: string; inf
 
 function ShareHero({ info, children }: { info: PublicShareInfo; children?: React.ReactNode }) {
   const css = useStyles()
-  const remaining = info.max_downloads > 0 ? Math.max(0, info.max_downloads - info.download_count) : null
+  const remaining = shareRemaining(info)
   return (
     <header className={css.hero}>
       <div className={css.identity}>
-        <span className={css.icon}>{info.type === 'dir' ? <IconFolder size={27} /> : <IconFile size={27} />}</span>
+        <EntryIcon name={info.name} type={info.type} size={56} />
         <div style={{ minWidth: 0 }}>
           <h1 className={css.title}>{info.name}</h1>
           <div className={css.meta}>
-            <span>{info.type === 'dir' ? '共享文件夹' : '共享文件'}</span>
+            <span>{info.type === 'dir' ? '共享文件夹' : guessType(info.name)}</span>
+            {info.size != null && info.type === 'file' ? <span>{formatShareSize(info.size)}</span> : null}
             <span>{info.expires_at ? `有效至 ${formatDate(info.expires_at)}` : '长期有效'}</span>
             {remaining !== null ? <span>剩余 {remaining} / {info.max_downloads} 次下载</span> : null}
-            {info.size != null && info.type === 'file' ? <span>{formatShareSize(info.size)}</span> : null}
           </div>
         </div>
       </div>
       {children ? <div className={css.actions}>{children}</div> : null}
     </header>
   )
+}
+
+function shareRemaining(info: PublicShareInfo): number | null {
+  return info.max_downloads > 0 ? Math.max(0, info.max_downloads - info.download_count) : null
 }
 
 function formatShareSize(size: number): string {

@@ -18,36 +18,39 @@ export const useStyles = makeStyles({
   identity: {
   'display': 'flex',
   'alignItems': 'center',
-  ...shorthands.gap('16px'),
+  ...shorthands.gap('18px'),
   'minWidth': '0px',
   'maxWidth': '100%',
   },
-  icon: {
-  'width': '54px',
-  'height': '54px',
-  'flex': '0 0 auto',
-  'display': 'inline-flex',
-  'alignItems': 'center',
-  'justifyContent': 'center',
-  'color': 'var(--colorBrandBackground)',
-  'background': 'var(--colorBrandBackground2)',
-  ...shorthands.borderRadius('var(--borderRadiusMedium)'),
-  },
+  // 文件名换行不截断：最多两行（line-clamp），行高独立设定，
+  // 长文件名/无空格长词靠 overflow-wrap anywhere 断行。
   title: {
+  'display': '-webkit-box',
+  'WebkitBoxOrient': 'vertical',
+  'WebkitLineClamp': 2,
   ...shorthands.overflow('hidden'),
   ...shorthands.margin('0px'),
   'color': 'var(--colorNeutralForeground1)',
-  'fontSize': '24px',
-  'textOverflow': 'ellipsis',
-  'whiteSpace': 'nowrap',
+  'fontSize': '26px',
+  'fontWeight': 600,
+  'lineHeight': 1.25,
+  'letterSpacing': '-0.015em',
+  'overflowWrap': 'anywhere',
+  [media.sm]: {
+    'fontSize': '20px',
+  },
   },
   meta: {
   'display': 'flex',
   'flexWrap': 'wrap',
-  ...shorthands.gap('6px 14px'),
-  'marginTop': '7px',
+  // 不用 shorthands.gap 双值形式：griffel 对 "6px 16px" 会静默丢弃，
+  // meta 各项会挤在一起；显式 longhand 才可靠。
+  'rowGap': '6px',
+  'columnGap': '16px',
+  'marginTop': '8px',
   'color': 'var(--colorNeutralForeground2)',
   'fontSize': '13px',
+  'lineHeight': 1.4,
   },
   actions: {
   'display': 'flex',
@@ -203,5 +206,52 @@ export const useStyles = makeStyles({
   'marginBottom': '40px',
   'display': 'flex',
   'flexDirection': 'column',
+  },
+  // 不可预览文件的居中舞台：main 是 flexGrow 的 flex 列，这里再撑满一层，
+  // 让「这是什么文件 + 下载」垂直居中于顶栏与页脚之间。
+  stage: {
+  'flexGrow': 1,
+  'display': 'flex',
+  'alignItems': 'center',
+  'justifyContent': 'center',
+  ...shorthands.padding('48px', '0', '64px'),
+  },
+  stageInner: {
+  'display': 'flex',
+  'flexDirection': 'column',
+  'alignItems': 'center',
+  ...shorthands.gap('20px'),
+  'width': '100%',
+  'maxWidth': '680px',
+  'textAlign': 'center',
+  ...shorthands.padding('0px', '8px'),
+  },
+  stageTitle: {
+  'display': '-webkit-box',
+  'WebkitBoxOrient': 'vertical',
+  // 舞台是居中构图、下方全是余量，放到 3 行：移动端两行会把 .docx 这类
+  // 扩展名截进省略号，而扩展名正是这份文件的身份。
+  'WebkitLineClamp': 3,
+  ...shorthands.overflow('hidden'),
+  ...shorthands.margin('0px'),
+  'color': 'var(--colorNeutralForeground1)',
+  'fontSize': '26px',
+  'fontWeight': 600,
+  'lineHeight': 1.25,
+  'letterSpacing': '-0.015em',
+  'overflowWrap': 'anywhere',
+  [media.sm]: {
+    'fontSize': '20px',
+  },
+  },
+  stageMeta: {
+  'display': 'flex',
+  'flexWrap': 'wrap',
+  'justifyContent': 'center',
+  'rowGap': '6px',
+  'columnGap': '16px',
+  'color': 'var(--colorNeutralForeground2)',
+  'fontSize': '13px',
+  'lineHeight': 1.4,
   },
 })

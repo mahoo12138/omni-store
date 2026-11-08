@@ -226,7 +226,8 @@ export function FileTable({
 }
 
 // 按文件名推断文件类型描述（与 EntryIcon 中的 fileTypeMap / imageExts 保持一致）。
-function guessType(name: string): string {
+// 导出供分享页等需要「这份文件是什么」一句话描述的地方复用。
+export function guessType(name: string): string {
   const dot = name.lastIndexOf('.')
   if (dot < 0) return '文件'
   const ext = name.slice(dot + 1).toLowerCase()
