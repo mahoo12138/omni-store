@@ -33,11 +33,19 @@ OmniStore 支持以 OIDC 授权码流程接入外部身份提供方（首测 Cas
 
 issuer 允许 http/https（自托管 Casdoor 常为内网 http）；JWKS 与 discovery 由 go-oidc 缓存，配置变更（指纹：issuer+client+secret+scopes）后重建客户端。
 
+## 登录名解析（令牌布局判别）
+
+不同 IdP 的 ID token 布局不同，登录名按布局判别（`internal/oidc` 的 `Claims.Username()`）：
+
+1. `preferred_username` 存在 → 标准 OIDC 语义，登录名即它（此时 `name` 是显示名，绝不参与解析）；
+2. 缺失但 casdoor 特有的 `displayName` claim 存在（值为空串也算存在）→ casdoor 布局，登录名是 `name`、显示名是 `displayName`。casdoor 默认 tokenFormat=JWT（legacy）及 JWT-Empty/JWT-Custom 都是这个布局；
+3. 两者皆无（第三方 IdP 的标准令牌、未配置字段的 JWT-Custom 等）→ 空登录名，JIT/自动绑定显式失败 `oidc_username_missing`，绝不把可能是全名的 `name` 当登录名。
+
 ## 用户映射优先级
 
-1. `(oidc_iss, oidc_sub)` 精确匹配已绑定用户 → 登录；
-2. `auto_link_username` 开启且 `preferred_username` 匹配未绑定的普通账号 → 绑定并登录；
-3. `auto_create_users` 开启 → 清洗用户名（非法字符替换为 `_`、截断 32 位、去首尾 `_`/`-`）后建号；用户名冲突返回 `oidc_username_conflict`；
+1. `(oidc_iss, oidc_sub)` 精确匹配已绑定用户 → 登录（与令牌布局无关）；
+2. `auto_link_username` 开启且解析出的登录名匹配未绑定的普通账号 → 绑定并登录；
+3. `auto_create_users` 开启 → 清洗用户名（非法字符替换为 `_`、截断 32 位、去首尾 `_`/`-`）后建号；用户名冲突返回 `oidc_username_conflict`，令牌无可用登录名返回 `oidc_username_missing`；
 4. 均不满足 → `oidc_identity_unbound`。
 
 被禁用账号即使已绑定也拒绝（`oidc_account_disabled`）。

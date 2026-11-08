@@ -21,3 +21,6 @@ Thumbs.db
 .playwright-cli/
 output/
 .zcode/
+
+# 本地临时测试沙箱(casdoor 联调 / 手动 E2E 环境)
+.tmp-*/

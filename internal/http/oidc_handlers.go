@@ -26,6 +26,7 @@ const (
 	oidcErrIdentityUnbound   = "oidc_identity_unbound"
 	oidcErrIdentityTaken     = "oidc_identity_taken"
 	oidcErrUsernameInvalid   = "oidc_username_invalid"
+	oidcErrUsernameMissing   = "oidc_username_missing"
 	oidcErrUsernameConflict  = "oidc_username_conflict"
 	oidcErrAccountDisabled   = "oidc_account_disabled"
 	oidcErrBindRequiresLogin = "oidc_bind_requires_login"
@@ -210,7 +211,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 
 // resolveOIDCUser 按映射优先级解析 IdP 身份对应的本地账号：
 // 已绑定 → 按用户名自动绑定（仅普通账号）→ JIT 建号 → 拒绝。
-// 返回空错误码表示成功。
+// 返回空错误码表示成功。登录名由 claims.Username() 按令牌布局判别。
 func (s *Server) resolveOIDCUser(cfg *oidc.Config, issuer string, claims *oidc.Claims) (*models.User, string) {
 	u, err := s.users.GetByOIDCIdentity(issuer, claims.Subject)
 	if err == nil {
@@ -220,9 +221,9 @@ func (s *Server) resolveOIDCUser(cfg *oidc.Config, issuer string, claims *oidc.C
 		return nil, oidcErrInternal
 	}
 
-	preferred := strings.TrimSpace(claims.PreferredUsername)
-	if cfg.AutoLinkUsername && preferred != "" {
-		if lu, err := s.users.GetByUsername(preferred); err == nil {
+	username := claims.Username()
+	if cfg.AutoLinkUsername && username != "" {
+		if lu, err := s.users.GetByUsername(username); err == nil {
 			// 自动绑定仅限未绑定的普通账号：防止 IdP 侧同名账号抢占本地超管。
 			if lu.Role == models.RoleUser && lu.OIDCSubject == "" && !lu.IsDisabled {
 				if err := s.users.BindOIDC(lu.ID, issuer, claims.Subject); err == nil {
@@ -233,12 +234,16 @@ func (s *Server) resolveOIDCUser(cfg *oidc.Config, issuer string, claims *oidc.C
 			return nil, oidcErrInternal
 		}
 	}
-	if cfg.AutoCreateUsers && preferred != "" {
-		username, err := users.NormalizeOIDCUsername(preferred)
+	if cfg.AutoCreateUsers {
+		if username == "" {
+			// 令牌布局不含可用登录名（如未配置字段的 JWT-Custom、第三方 IdP），显式失败。
+			return nil, oidcErrUsernameMissing
+		}
+		normalized, err := users.NormalizeOIDCUsername(username)
 		if err != nil {
 			return nil, oidcErrUsernameInvalid
 		}
-		created, err := s.users.CreateOIDCUser(username, claims.Name, claims.Email, issuer, claims.Subject)
+		created, err := s.users.CreateOIDCUser(normalized, claims.Display(), claims.Email, issuer, claims.Subject)
 		if err != nil {
 			if errors.Is(err, users.ErrUsernameTaken) {
 				return nil, oidcErrUsernameConflict

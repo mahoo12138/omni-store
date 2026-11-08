@@ -250,4 +250,4 @@ POST /api/v1/admin/users/{id}/unbind-oidc    # 管理员强制解绑
 
 `GET /api/v1/auth/status` 增加 `oidc_enabled`；`GET /api/v1/system/status` 增加 `sso: {enabled, status, hint}`。`GET /api/v1/auth/me` 的 `user` 增加 `email`、`sso_bound`（`oidc_iss`/`oidc_sub` 不出任何 API 响应）。
 
-回调失败统一 302 `/login?sso_error=<code>`，code 取值：`oidc_disabled`、`oidc_not_configured`、`oidc_state_mismatch`、`oidc_provider_denied`、`oidc_exchange_failed`、`oidc_identity_unbound`、`oidc_identity_taken`、`oidc_username_invalid`、`oidc_username_conflict`、`oidc_account_disabled`、`oidc_bind_requires_login`、`oidc_rate_limited`、`oidc_internal`。这些码不是 HTTP API 错误码，仅供前端登录页展示中文提示。
+回调失败统一 302 `/login?sso_error=<code>`，code 取值：`oidc_disabled`、`oidc_not_configured`、`oidc_state_mismatch`、`oidc_provider_denied`、`oidc_exchange_failed`、`oidc_identity_unbound`、`oidc_identity_taken`、`oidc_username_invalid`、`oidc_username_missing`、`oidc_username_conflict`、`oidc_account_disabled`、`oidc_bind_requires_login`、`oidc_rate_limited`、`oidc_internal`。这些码不是 HTTP API 错误码，仅供前端登录页展示中文提示。
