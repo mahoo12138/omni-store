@@ -17,15 +17,12 @@ interface FakeClaims {
   email: string
 }
 
-/** token 布局:standard = OIDC 标准语义;legacy = casdoor 默认 JWT 格式(name=登录名,displayName 恒存在)。 */
-type FakeClaimsMode = 'standard' | 'legacy' | 'bare'
 
 class FakeIdP {
   private server: Server
   private privateKey: KeyObject
   private kid = 'e2e-key-1'
   issuer = ''
-  claimsMode: FakeClaimsMode = 'standard'
   claims: FakeClaims = { sub: 'e2e-sub-1', preferred_username: 'e2e-sso-user', name: 'E2E SSO 用户', email: 'sso@example.com' }
 
   constructor() {
@@ -92,17 +89,12 @@ class FakeIdP {
   private signIDToken(): string {
     const now = Math.floor(Date.now() / 1000)
     const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: this.kid })).toString('base64url')
-    const base = {
+    const payload = Buffer.from(JSON.stringify({
       iss: this.issuer, sub: this.claims.sub, aud: FAKE_CLIENT_ID,
       exp: now + 3600, iat: now, nonce: this.currentNonce,
-      email: this.claims.email,
-    }
-    const body = this.claimsMode === 'legacy'
-      ? { ...base, name: this.claims.preferred_username, displayName: this.claims.name }
-      : this.claimsMode === 'bare'
-        ? base
-        : { ...base, preferred_username: this.claims.preferred_username, name: this.claims.name }
-    const payload = Buffer.from(JSON.stringify(body)).toString('base64url')
+      preferred_username: this.claims.preferred_username,
+      name: this.claims.name, email: this.claims.email,
+    })).toString('base64url')
     const signature = createSign('RSA-SHA256').update(`${header}.${payload}`).sign(this.privateKey)
     return `${header}.${payload}.${signature.toString('base64url')}`
   }
@@ -183,33 +175,6 @@ test.describe('OIDC 单点登录', () => {
     expect(meBody.data.user.username).toBe('e2e-sso-user')
     expect(meBody.data.user.sso_bound).toBe(true)
     expect(meBody.data.user.role).toBe('user')
-
-    await api.dispose()
-    await idp.stop()
-  })
-
-  test('casdoor legacy 令牌布局(默认 JWT 格式)同样支持 JIT 建号登录', async ({ page }) => {
-    const idp = new FakeIdP()
-    const issuer = await idp.start()
-    const { request: api, csrf } = await loginAdmin(process.env.OMNISTORE_E2E_BASE_URL ?? 'http://127.0.0.1:18080')
-    await configureSso(api, csrf, { issuer, autoCreate: true, autoLink: false })
-    idp.claimsMode = 'legacy'
-    idp.claims = { sub: 'e2e-legacy-sub', preferred_username: 'legacy-user', name: 'Legacy 用户', email: 'legacy@example.com' }
-
-    await page.goto('/login')
-    const ssoButton = page.getByRole('link', { name: '使用 SSO 登录' })
-    await expect(ssoButton).toBeVisible()
-    await Promise.all([
-      page.waitForURL(/\/app$/),
-      ssoButton.click(),
-    ])
-
-    const me = await page.request.get('/api/v1/auth/me')
-    expect(me.ok()).toBeTruthy()
-    const meBody = (await me.json()) as { data: { user: { username: string; display_name: string; email: string; sso_bound: boolean } } }
-    expect(meBody.data.user.username).toBe('legacy-user')
-    expect(meBody.data.user.display_name).toBe('Legacy 用户')
-    expect(meBody.data.user.sso_bound).toBe(true)
 
     await api.dispose()
     await idp.stop()

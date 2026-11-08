@@ -211,7 +211,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 
 // resolveOIDCUser 按映射优先级解析 IdP 身份对应的本地账号：
 // 已绑定 → 按用户名自动绑定（仅普通账号）→ JIT 建号 → 拒绝。
-// 返回空错误码表示成功。登录名由 claims.Username() 按令牌布局判别。
+// 返回空错误码表示成功。登录名一律取标准 OIDC 的 preferred_username。
 func (s *Server) resolveOIDCUser(cfg *oidc.Config, issuer string, claims *oidc.Claims) (*models.User, string) {
 	u, err := s.users.GetByOIDCIdentity(issuer, claims.Subject)
 	if err == nil {
@@ -221,7 +221,7 @@ func (s *Server) resolveOIDCUser(cfg *oidc.Config, issuer string, claims *oidc.C
 		return nil, oidcErrInternal
 	}
 
-	username := claims.Username()
+	username := strings.TrimSpace(claims.PreferredUsername)
 	if cfg.AutoLinkUsername && username != "" {
 		if lu, err := s.users.GetByUsername(username); err == nil {
 			// 自动绑定仅限未绑定的普通账号：防止 IdP 侧同名账号抢占本地超管。
@@ -236,14 +236,14 @@ func (s *Server) resolveOIDCUser(cfg *oidc.Config, issuer string, claims *oidc.C
 	}
 	if cfg.AutoCreateUsers {
 		if username == "" {
-			// 令牌布局不含可用登录名（如未配置字段的 JWT-Custom、第三方 IdP），显式失败。
+			// 标准 OIDC 登录名声明缺失：显式失败，由 IdP 侧修正，不做猜测回退。
 			return nil, oidcErrUsernameMissing
 		}
 		normalized, err := users.NormalizeOIDCUsername(username)
 		if err != nil {
 			return nil, oidcErrUsernameInvalid
 		}
-		created, err := s.users.CreateOIDCUser(normalized, claims.Display(), claims.Email, issuer, claims.Subject)
+		created, err := s.users.CreateOIDCUser(normalized, claims.Name, claims.Email, issuer, claims.Subject)
 		if err != nil {
 			if errors.Is(err, users.ErrUsernameTaken) {
 				return nil, oidcErrUsernameConflict

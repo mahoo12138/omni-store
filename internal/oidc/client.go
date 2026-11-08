@@ -27,44 +27,14 @@ type Client struct {
 }
 
 // Claims 是登录所需的 ID token 声明子集。
+// 登录名一律取标准 OIDC 的 preferred_username 声明；IdP 不提供该声明时
+// 自动绑定与 JIT 显式失败（oidc_username_missing），不做任何按 IdP 的猜测回退。
 type Claims struct {
 	Subject           string `json:"sub"`
 	Nonce             string `json:"nonce"`
 	PreferredUsername string `json:"preferred_username"`
 	Name              string `json:"name"`
-	// DisplayName 仅用于令牌布局判别。casdoor 系格式(legacy JWT、JWT-Empty、
-	// JWT-Custom)总会携带该 claim 且 name=登录名;标准 OIDC 令牌没有它,其 name
-	// 是显示名。指针用于区分「claim 不存在」与「值为空串」。
-	DisplayName *string `json:"displayName"`
-	Email       string  `json:"email"`
-}
-
-// Username 按令牌布局判别登录名:
-//  1. preferred_username 存在 → 标准 OIDC 语义,登录名即它(此时 name 是显示名,
-//     绝不参与登录名解析);
-//  2. 缺失但 casdoor 特有的 displayName claim 存在 → casdoor 布局,登录名是 name
-//     (显示名缺失时由建号逻辑回退到登录名);
-//  3. 两者皆无(其他 IdP、JWT-Custom 未选字段等)→ 空串,调用方显式失败,
-//     绝不把可能是全名的 name 当登录名。
-func (c *Claims) Username() string {
-	if c.PreferredUsername != "" {
-		return c.PreferredUsername
-	}
-	if c.DisplayName != nil {
-		return c.Name
-	}
-	return ""
-}
-
-// Display 按同一布局判别返回显示名,可为空。
-func (c *Claims) Display() string {
-	if c.PreferredUsername != "" {
-		return c.Name
-	}
-	if c.DisplayName != nil {
-		return *c.DisplayName
-	}
-	return ""
+	Email             string `json:"email"`
 }
 
 // NewClient 连接 IdP 完成 discovery 并构建 ID token 验证器。

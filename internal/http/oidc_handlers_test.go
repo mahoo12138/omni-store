@@ -101,21 +101,7 @@ func (f *fakeIDP) setClaims(nonce, sub, preferred, name, email string) {
 	}
 }
 
-// setLegacyClaims 模拟 casdoor legacy JWT 布局：无 preferred_username，
-// name=登录名，displayName claim 恒存在（可为空串，无 omitempty）。
-func (f *fakeIDP) setLegacyClaims(nonce, sub, loginName, display, email string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	now := time.Now()
-	f.claims = map[string]any{
-		"iss": f.issuer, "sub": sub, "aud": fakeOIDCClientID,
-		"exp": now.Add(time.Hour).Unix(), "iat": now.Unix(),
-		"nonce": nonce, "name": loginName, "displayName": display, "email": email,
-	}
-}
-
-// setBareClaims 模拟无可用登录名的布局（JWT-Custom 未选字段、第三方 IdP）：
-// 既无 preferred_username 也无 displayName claim。
+// setBareClaims 模拟缺少标准 preferred_username 声明的令牌（不合规 IdP 配置）。
 func (f *fakeIDP) setBareClaims(nonce, sub, email string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -391,83 +377,25 @@ func TestOIDCFlowValidation(t *testing.T) {
 	rec3 := followOIDCCallback(t, server.Handler, location3, flowCookie3)
 	assertOIDCRedirectError(t, rec3, oidcErrUsernameInvalid)
 
+	// 令牌缺少标准 preferred_username 声明：JIT 显式失败，不做猜测回退。
+	location4, flowCookie4 := startOIDCLogin(t, server.Handler, "", nil)
+	idp.setBareClaims(location4.Query().Get("nonce"), "sub-bare", "bare@example.com")
+	rec4 := followOIDCCallback(t, server.Handler, location4, flowCookie4)
+	assertOIDCRedirectError(t, rec4, oidcErrUsernameMissing)
+	if count, err := s.users.Count(); err != nil || count != 0 {
+		t.Fatalf("no user should be created: %d %v", count, err)
+	}
+
 	// 自动建号关闭时未绑定身份被拒绝。
 	configureOIDC(t, s, func(c *oidc.Config) {
 		c.Issuer = idp.issuer
 		c.AutoLinkUsername = false
 		c.AutoCreateUsers = false
 	})
-	location4, flowCookie4 := startOIDCLogin(t, server.Handler, "", nil)
-	idp.setClaims(location4.Query().Get("nonce"), "sub-unknown", "stranger", "Stranger", "s@example.com")
-	rec4 := followOIDCCallback(t, server.Handler, location4, flowCookie4)
-	assertOIDCRedirectError(t, rec4, oidcErrIdentityUnbound)
-}
-
-// casdoor legacy 布局（name=登录名、displayName 恒存在）：自动绑定与 JIT 均可用。
-func TestOIDCLegacyTokenLayout(t *testing.T) {
-	idp := newFakeIDP(t)
-	server, s := newAuthIntegrationServerWithConfig(t, nil)
-	if _, err := s.users.Create("carol", "Carol 显示名", "carol-password", models.RoleUser); err != nil {
-		t.Fatal(err)
-	}
-	configureOIDC(t, s, func(c *oidc.Config) {
-		c.Issuer = idp.issuer
-		c.AutoLinkUsername = true
-		c.AutoCreateUsers = true
-	})
-
-	// 自动绑定：legacy 布局的 name 命中同名普通账号。
-	location, flowCookie := startOIDCLogin(t, server.Handler, "", nil)
-	idp.setLegacyClaims(location.Query().Get("nonce"), "sub-legacy-carol", "carol", "Carol 显示名", "carol@example.com")
-	rec := followOIDCCallback(t, server.Handler, location, flowCookie)
-	sessionCookie := assertOIDCLoginSuccess(t, rec)
-	me := serveTestRequest(t, server.Handler, http.MethodGet, "/api/v1/auth/me", "", sessionCookie, "")
-	var meEnvelope struct {
-		Data struct {
-			User models.User `json:"user"`
-		} `json:"data"`
-	}
-	decodeTestJSON(t, me, &meEnvelope)
-	if meEnvelope.Data.User.ID == 0 || meEnvelope.Data.User.Username != "carol" || !meEnvelope.Data.User.SSOBound {
-		t.Fatalf("legacy auto-link failed: %+v", meEnvelope.Data.User)
-	}
-
-	// JIT：legacy 布局且无同名校友 → 建号，显示名取 displayName。
-	location2, flowCookie2 := startOIDCLogin(t, server.Handler, "", nil)
-	idp.setLegacyClaims(location2.Query().Get("nonce"), "sub-legacy-hank", "hank", "Hank", "hank@example.com")
-	rec2 := followOIDCCallback(t, server.Handler, location2, flowCookie2)
-	assertOIDCLoginSuccess(t, rec2)
-	created, err := s.users.GetByUsername("hank")
-	if err != nil || created.Email != "hank@example.com" || created.DisplayName != "Hank" {
-		t.Fatalf("legacy JIT failed: %+v %v", created, err)
-	}
-
-	// 显示名为空串的 legacy 用户（displayName claim 存在但为 ""）→ 回退登录名。
-	location3, flowCookie3 := startOIDCLogin(t, server.Handler, "", nil)
-	idp.setLegacyClaims(location3.Query().Get("nonce"), "sub-legacy-nodisplay", "nodisplay", "", "nd@example.com")
-	rec3 := followOIDCCallback(t, server.Handler, location3, flowCookie3)
-	assertOIDCLoginSuccess(t, rec3)
-	created2, err := s.users.GetByUsername("nodisplay")
-	if err != nil || created2.DisplayName != "nodisplay" {
-		t.Fatalf("legacy empty display fallback failed: %+v %v", created2, err)
-	}
-}
-
-// 无可用登录名的布局：JIT 开启时显式失败，绝不把 name 全名当登录名。
-func TestOIDCUsernameMissingLayout(t *testing.T) {
-	idp := newFakeIDP(t)
-	server, s := newAuthIntegrationServerWithConfig(t, nil)
-	configureOIDC(t, s, func(c *oidc.Config) {
-		c.Issuer = idp.issuer
-		c.AutoCreateUsers = true
-	})
-	location, flowCookie := startOIDCLogin(t, server.Handler, "", nil)
-	idp.setBareClaims(location.Query().Get("nonce"), "sub-bare", "bare@example.com")
-	rec := followOIDCCallback(t, server.Handler, location, flowCookie)
-	assertOIDCRedirectError(t, rec, oidcErrUsernameMissing)
-	if count, err := s.users.Count(); err != nil || count != 0 {
-		t.Fatalf("no user should be created: %d %v", count, err)
-	}
+	location5, flowCookie5 := startOIDCLogin(t, server.Handler, "", nil)
+	idp.setClaims(location5.Query().Get("nonce"), "sub-unknown", "stranger", "Stranger", "s@example.com")
+	rec5 := followOIDCCallback(t, server.Handler, location5, flowCookie5)
+	assertOIDCRedirectError(t, rec5, oidcErrIdentityUnbound)
 }
 
 func TestOIDCBindFlow(t *testing.T) {

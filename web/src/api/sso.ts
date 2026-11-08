@@ -63,7 +63,7 @@ export const SSO_ERROR_MESSAGES: Record<string, string> = {
   oidc_identity_unbound: '当前 IdP 账号尚未开通本站访问，请联系管理员绑定或开通。',
   oidc_identity_taken: '该 SSO 身份已绑定其他账号，请勿重复绑定。',
   oidc_username_invalid: 'IdP 返回的用户名不符合本站规则，无法自动创建账号。',
-  oidc_username_missing: '身份提供方返回的令牌中没有可用的登录名（令牌布局不受支持），请联系管理员检查 SSO 配置。',
+  oidc_username_missing: '身份提供方返回的令牌缺少标准 preferred_username 声明，请联系管理员检查 IdP 配置。',
   oidc_username_conflict: '同名用户已存在，无法自动创建账号，请联系管理员绑定。',
   oidc_account_disabled: '该账号已被禁用，请联系管理员。',
   oidc_bind_requires_login: '绑定 SSO 身份前请先登录本站。',
