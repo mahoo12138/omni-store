@@ -4,6 +4,7 @@ package security
 import (
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -27,7 +28,7 @@ func NewProxyResolver(entries []string) *ProxyResolver {
 				if ip.To4() == nil {
 					bits = 128
 				}
-				e = ip.String() + "/" + itoa(bits)
+				e = ip.String() + "/" + strconv.Itoa(bits)
 			}
 		}
 		if _, ipnet, err := net.ParseCIDR(e); err == nil {
@@ -35,13 +36,6 @@ func NewProxyResolver(entries []string) *ProxyResolver {
 		}
 	}
 	return r
-}
-
-func itoa(n int) string {
-	if n == 32 {
-		return "32"
-	}
-	return "128"
 }
 
 func (r *ProxyResolver) isTrusted(ip net.IP) bool {

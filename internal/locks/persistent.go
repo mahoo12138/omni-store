@@ -48,15 +48,31 @@ type SourceMutation struct {
 	Scopes          []MutationScope
 }
 
+const persistentLockSweepInterval = time.Minute
+
 // PersistentStore 管理跨请求、跨进程重启保留的 WebDAV 锁。
 // mu 将“检查锁 -> 文件变更”与 LOCK 创建串行化，避免检查后的竞态。
 type PersistentStore struct {
-	db *sql.DB
-	mu sync.Mutex
+	db        *sql.DB
+	rdb       *sql.DB
+	mu        sync.Mutex
+	lastSweep time.Time
 }
 
 func NewPersistentStore(db *sql.DB) *PersistentStore {
 	return &PersistentStore{db: db}
+}
+
+// SetReadDB 注入只读连接池用于锁发现和读查询。
+func (s *PersistentStore) SetReadDB(rdb *sql.DB) {
+	s.rdb = rdb
+}
+
+func (s *PersistentStore) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
 }
 
 // GuardMutation 校验受影响路径上的锁；成功时调用方必须执行返回的结束函数。
@@ -243,6 +259,16 @@ func (s *PersistentStore) CleanupExpired(ctx context.Context) (int64, error) {
 }
 
 func (s *PersistentStore) cleanupExpired(ctx context.Context) error {
+	now := time.Now().UTC()
+	var hasExpired int
+	// 利用 idx_webdav_locks_expires_at 在只读池做零写开销检查；仅当确实存在过期锁时才触发写池 DELETE。
+	if err := s.readDB().QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM webdav_locks WHERE expires_at <= ?)`, now).Scan(&hasExpired); err != nil {
+		return err
+	}
+	if hasExpired == 0 {
+		return nil
+	}
 	_, err := s.cleanupExpiredCount(ctx)
 	return err
 }
@@ -274,18 +300,24 @@ func (s *PersistentStore) deleteLocksRootedAt(ctx context.Context, storageSource
 
 func (s *PersistentStore) get(ctx context.Context, token string) (*PersistentLock, error) {
 	var lock PersistentLock
-	err := s.db.QueryRowContext(ctx, `SELECT token, storage_source_id, relative_path, depth, owner_xml,
+	err := s.readDB().QueryRowContext(ctx, `SELECT token, storage_source_id, relative_path, depth, owner_xml,
   owner_user_id, created_at, refreshed_at, expires_at FROM webdav_locks WHERE token = ?`, token).
 		Scan(&lock.Token, &lock.StorageSourceID, &lock.RelativePath, &lock.Depth, &lock.OwnerXML,
 			&lock.OwnerUserID, &lock.CreatedAt, &lock.RefreshedAt, &lock.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrLockNotFound
 	}
-	return &lock, err
+	if err != nil {
+		return nil, err
+	}
+	if !lock.ExpiresAt.After(time.Now().UTC()) {
+		return nil, ErrLockNotFound
+	}
+	return &lock, nil
 }
 
 func (s *PersistentStore) listSource(ctx context.Context, storageSourceID int64) ([]PersistentLock, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT token, storage_source_id, relative_path, depth, owner_xml,
+	rows, err := s.readDB().QueryContext(ctx, `SELECT token, storage_source_id, relative_path, depth, owner_xml,
   owner_user_id, created_at, refreshed_at, expires_at FROM webdav_locks
   WHERE storage_source_id = ? AND expires_at > ? ORDER BY created_at`, storageSourceID, time.Now().UTC())
 	if err != nil {

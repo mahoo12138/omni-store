@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
 )
@@ -46,12 +47,27 @@ var DefaultExcludePatterns = []string{
 // Service 提供存储源管理能力。
 type Service struct {
 	db      *sql.DB
+	rdb     *sql.DB
 	dataDir string
+	rootsMu sync.RWMutex
+	roots   map[int64]*cachedSourceRoot
 }
 
 // NewService 创建存储源服务。dataDir 用于路径安全校验。
 func NewService(db *sql.DB, dataDir string) *Service {
 	return &Service{db: db, dataDir: dataDir}
+}
+
+// SetReadDB 注入只读连接池，供高频存储源元数据与排除规则查询使用。
+func (s *Service) SetReadDB(rdb *sql.DB) {
+	s.rdb = rdb
+}
+
+func (s *Service) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
 }
 
 // DataDir 返回系统数据目录，供文件服务存放回收站等内部数据；不得作为用户存储源。
@@ -144,7 +160,7 @@ func (s *Service) CreateWithInitializer(in CreateInput, initialize CreateInitial
 	  (key, name, description, root_path, is_disabled, webdav_enabled, s3_enabled, created_at, updated_at)
 	  VALUES (?, ?, ?, ?, 0, 1, 0, ?, ?)`,
 			key, in.Name, in.Description, realPath, now, now)
-		if err == nil || !strings.Contains(err.Error(), "storage_sources.key") {
+		if err == nil || !db.IsUniqueConstraint(err, "storage_sources.key") {
 			break
 		}
 	}
@@ -199,17 +215,17 @@ func (s *Service) allRootPaths() ([]string, error) {
 
 // Get 按系统生成的不透明 key 查询存储源。
 func (s *Service) Get(key string) (*models.StorageSource, error) {
-	return scanSource(s.db.QueryRow(`SELECT `+sourceColumns+` FROM storage_sources WHERE key = ?`, key))
+	return scanSource(s.readDB().QueryRow(`SELECT `+sourceColumns+` FROM storage_sources WHERE key = ?`, key))
 }
 
 // GetByID 仅供持久化关联解析使用；数字主键不暴露到用户路由。
 func (s *Service) GetByID(id int64) (*models.StorageSource, error) {
-	return scanSource(s.db.QueryRow(`SELECT `+sourceColumns+` FROM storage_sources WHERE id = ?`, id))
+	return scanSource(s.readDB().QueryRow(`SELECT `+sourceColumns+` FROM storage_sources WHERE id = ?`, id))
 }
 
 // List 返回全部存储源（管理员）。
 func (s *Service) List() ([]*models.StorageSource, error) {
-	rows, err := s.db.Query(`SELECT ` + sourceColumns + ` FROM storage_sources ORDER BY id`)
+	rows, err := s.readDB().Query(`SELECT ` + sourceColumns + ` FROM storage_sources ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +358,11 @@ func (s *Service) Delete(key string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.InvalidateRoot(id)
+	return nil
 }
 
 // UpdateRootPath 重新绑定存储源根路径（备份恢复/磁盘迁移后的管理动作）。
@@ -374,6 +394,8 @@ func (s *Service) UpdateRootPath(key, newRoot string) (*models.StorageSource, er
 		realPath, time.Now().UTC(), src.ID); err != nil {
 		return nil, fmt.Errorf("更新存储源根路径失败: %w", err)
 	}
+	_, _ = s.db.Exec(`DELETE FROM source_usage WHERE storage_source_id = ?`, src.ID)
+	s.InvalidateRoot(src.ID)
 	return s.Get(key)
 }
 
@@ -381,7 +403,7 @@ func (s *Service) UpdateRootPath(key, newRoot string) (*models.StorageSource, er
 
 // ExcludePatterns 返回存储源的自定义排除规则（不含系统强制规则）。
 func (s *Service) ExcludePatterns(id int64) ([]string, error) {
-	rows, err := s.db.Query(`SELECT pattern FROM storage_source_exclude_patterns
+	rows, err := s.readDB().Query(`SELECT pattern FROM storage_source_exclude_patterns
   WHERE storage_source_id = ? ORDER BY id`, id)
 	if err != nil {
 		return nil, err

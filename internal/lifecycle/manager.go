@@ -30,33 +30,69 @@ type entry struct {
 	refs int
 }
 
-var registry = struct {
-	sync.Mutex
+// Manager coordinates lifecycle read/write leases for an application instance.
+// Injecting a per-app Manager prevents tests and independent server instances
+// from sharing package-level global lock state.
+type Manager struct {
+	mu      sync.Mutex
 	entries map[key]*entry
-}{entries: make(map[key]*entry)}
+}
+
+// NewManager creates an isolated lifecycle manager.
+func NewManager() *Manager {
+	return &Manager{entries: make(map[key]*entry)}
+}
+
+var defaultManager = NewManager()
+
+// Default returns the package-level fallback manager used when callers do not
+// inject an explicit *Manager.
+func Default() *Manager {
+	return defaultManager
+}
 
 // Read prevents the identified resources from being deleted until release.
-func Read(keys ...Key) func() { return acquire(false, keys) }
+func Read(keys ...Key) func() { return defaultManager.Read(keys...) }
 
 // Write waits for all in-flight operations on the resources and prevents new
 // ones from starting until release. Deletion checks and deletion must share one
 // Write lease.
-func Write(keys ...Key) func() { return acquire(true, keys) }
+func Write(keys ...Key) func() { return defaultManager.Write(keys...) }
 
-func acquire(write bool, requested []Key) func() {
+// Read prevents the identified resources from being deleted until release.
+func (m *Manager) Read(keys ...Key) func() {
+	if m == nil {
+		m = defaultManager
+	}
+	return m.acquire(false, keys)
+}
+
+// Write waits for all in-flight operations on the resources and prevents new
+// ones from starting until release.
+func (m *Manager) Write(keys ...Key) func() {
+	if m == nil {
+		m = defaultManager
+	}
+	return m.acquire(true, keys)
+}
+
+func (m *Manager) acquire(write bool, requested []Key) func() {
 	keys := normalizedKeys(requested)
 	entries := make([]*entry, len(keys))
-	registry.Lock()
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = make(map[key]*entry)
+	}
 	for i, item := range keys {
-		current := registry.entries[item]
+		current := m.entries[item]
 		if current == nil {
 			current = &entry{}
-			registry.entries[item] = current
+			m.entries[item] = current
 		}
 		current.refs++
 		entries[i] = current
 	}
-	registry.Unlock()
+	m.mu.Unlock()
 
 	for _, current := range entries {
 		if write {
@@ -76,14 +112,14 @@ func acquire(write bool, requested []Key) func() {
 					entries[i].mu.RUnlock()
 				}
 			}
-			registry.Lock()
+			m.mu.Lock()
 			for i, item := range keys {
 				entries[i].refs--
 				if entries[i].refs == 0 {
-					delete(registry.entries, item)
+					delete(m.entries, item)
 				}
 			}
-			registry.Unlock()
+			m.mu.Unlock()
 		})
 	}
 }

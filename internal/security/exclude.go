@@ -42,11 +42,18 @@ func NewExcludeMatcher(patterns []string) *ExcludeMatcher {
 
 // Match 判断相对路径是否命中任一排除规则。
 // relPath 必须是 NormalizeRelPath 的输出。
+// 系统内部段（.omnistore、.omnistore-upload-*、.omnistore-copy-*、.omnistore-write-test-*）
+// 始终按大小写不敏感方式强制排除，防止大小写不敏感文件系统上的变体绕过。
 func (m *ExcludeMatcher) Match(relPath string) bool {
 	if relPath == "" {
 		return false
 	}
 	segs := strings.Split(relPath, "/")
+	for _, seg := range segs {
+		if IsInternalSegment(seg) {
+			return true
+		}
+	}
 	for _, pat := range m.patterns {
 		if matchSegments(pat, segs) {
 			return true

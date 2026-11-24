@@ -71,9 +71,30 @@ func TestMultipleKeysUseStableOrderAndRegistryIsReleased(t *testing.T) {
 	}
 	wait.Wait()
 
-	registry.Lock()
-	defer registry.Unlock()
-	if len(registry.entries) != 0 {
-		t.Fatalf("released locks remained in registry: %d", len(registry.entries))
+	defaultManager.mu.Lock()
+	defer defaultManager.mu.Unlock()
+	if len(defaultManager.entries) != 0 {
+		t.Fatalf("released locks remained in registry: %d", len(defaultManager.entries))
+	}
+}
+
+func TestIndependentManagersAreIsolated(t *testing.T) {
+	m1 := NewManager()
+	m2 := NewManager()
+
+	releaseWrite := m1.Write(Source(7))
+	defer releaseWrite()
+
+	acquired := make(chan struct{})
+	go func() {
+		releaseRead := m2.Read(Source(7))
+		releaseRead()
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("m2.Read blocked on m1.Write despite isolated Manager instances")
 	}
 }

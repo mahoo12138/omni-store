@@ -17,11 +17,21 @@ var ErrManagedNamespace = errors.New("路径包含系统托管命名空间")
 // 系统服务（如图床）的内部数据保存在它的固定子目录中。
 const ManagedNamespaceSegment = ".omnistore"
 
-// IsReservedName 判断单个名称是否属于 OmniStore 内部操作命名空间。
+// IsReservedName 判断单个名称是否属于 OmniStore 内部操作命名空间（大小写不敏感）。
 // 外部已存在的同名文件仍是用户数据，但不能经 API 新建、写入或作为移动目标。
 func IsReservedName(name string) bool {
-	return strings.HasPrefix(name, ".omnistore-upload-") ||
-		strings.HasPrefix(name, ".omnistore-copy-")
+	lower := strings.ToLower(name)
+	return strings.HasPrefix(lower, ".omnistore-upload-") ||
+		strings.HasPrefix(lower, ".omnistore-copy-")
+}
+
+// IsInternalSegment 统一判断单个路径段是否属于 OmniStore 内部保留/托管/探针段
+// （大小写不敏感），供排除规则、目录枚举与路径安全检查统一复用。
+func IsInternalSegment(name string) bool {
+	if IsManagedNamespaceName(name) || IsReservedName(name) {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(name), ".omnistore-write-test-")
 }
 
 // IsManagedNamespaceName 判断单个名称是否为托管命名空间目录本身。
@@ -66,7 +76,7 @@ func NormalizeRelPath(input string) (string, error) {
 	}
 
 	for _, r := range p {
-		if r == 0 || (r < 32 && r != 0) {
+		if r < 32 {
 			return "", fmt.Errorf("路径包含非法控制字符")
 		}
 	}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
 )
@@ -59,7 +60,7 @@ func (s *Service) CreatePolicy(in PolicyInput) (*models.AccessPolicy, error) {
 		result, err = tx.Exec(`INSERT INTO access_policies
   (key, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
 			key, in.Name, strings.TrimSpace(in.Description), now, now)
-		if err == nil || !strings.Contains(err.Error(), "access_policies.key") {
+		if err == nil || !db.IsUniqueConstraint(err, "access_policies.key") {
 			break
 		}
 	}

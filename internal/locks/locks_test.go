@@ -1,6 +1,8 @@
 package locks
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -205,5 +207,74 @@ func TestPersistentLockScopeRelations(t *testing.T) {
 	}
 	if mutationIntersectsLock(MutationScope{Path: "docs", IncludeDescendants: false}, lock) {
 		t.Fatal("non-recursive parent mutation should not intersect child lock")
+	}
+}
+
+func TestManagerLockContextCancelsWaiterAndUnblocksQueuedBehind(t *testing.T) {
+	manager := NewManager()
+	unlockReader := manager.RLock(Key("src-a", "docs/report.txt"))
+
+	// 排队的祖先写锁先进入队列，会阻止后续读锁越队。
+	writerCtx, cancelWriter := context.WithCancel(context.Background())
+	writerErr := make(chan error, 1)
+	go func() {
+		_, err := manager.LockContext(writerCtx, Key("src-a", "docs"))
+		writerErr <- err
+	}()
+	waitForManagerWaiters(t, manager, 1)
+
+	secondReaderAcquired := make(chan struct{})
+	go func() {
+		unlock, err := manager.RLockContext(context.Background(), Key("src-a", "docs/other.txt"))
+		if err == nil {
+			close(secondReaderAcquired)
+			unlock()
+		}
+	}()
+	waitForManagerWaiters(t, manager, 2)
+
+	// 取消排队的写锁后，其后的读锁必须立刻获释，不再被已取消写锁阻塞。
+	cancelWriter()
+	select {
+	case err := <-writerErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled LockContext err=%v want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled LockContext did not return")
+	}
+	select {
+	case <-secondReaderAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("queued reader did not wake after blocking writer cancelled")
+	}
+	unlockReader()
+	if len(manager.entries) != 0 || len(manager.waiters) != 0 {
+		t.Fatalf("leaked entries=%d waiters=%d", len(manager.entries), len(manager.waiters))
+	}
+}
+
+func TestManagerCaseInsensitiveSourceLockNormalization(t *testing.T) {
+	manager := NewManager()
+	manager.SetSourceCaseInsensitive("src-ci", true)
+
+	unlock := manager.Lock(Key("src-ci", "Docs/Report.txt"))
+	acquired := make(chan struct{})
+	go func() {
+		release := manager.Lock(Key("src-ci", "docs/report.txt"))
+		close(acquired)
+		release()
+	}()
+	waitForManagerWaiters(t, manager, 1)
+	select {
+	case <-acquired:
+		t.Fatal("case-variant path bypassed lock on case-insensitive source")
+	case <-time.After(25 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("case-variant path did not acquire after release")
 	}
 }
