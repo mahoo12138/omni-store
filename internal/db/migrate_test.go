@@ -132,3 +132,41 @@ func TestMigrateNeverReplaysAppliedVersion(t *testing.T) {
 		t.Fatalf("applied_at changed: before=%q after=%q", appliedAtBefore, appliedAtAfter)
 	}
 }
+
+func TestMigrateRejectsNewerOrUnknownVersion(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "omnistore.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES ('v99.0.0', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("insert newer migration: %v", err)
+	}
+	if err := Migrate(conn); err == nil {
+		t.Fatal("Migrate() accepted newer schema version v99.0.0")
+	}
+}
+
+func TestIsUniqueConstraintDetectsSQLiteCodes(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "omnistore.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Exec(`CREATE TABLE uniq_test (id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(`INSERT INTO uniq_test (id, code) VALUES ('a', 'c1')`); err != nil {
+		t.Fatal(err)
+	}
+	_, pkErr := conn.Exec(`INSERT INTO uniq_test (id, code) VALUES ('a', 'c2')`)
+	if !IsUniqueConstraint(pkErr, "uniq_test.id") || IsUniqueConstraint(pkErr, "uniq_test.code") {
+		t.Fatalf("primary key conflict check failed: err=%v", pkErr)
+	}
+	_, uniqErr := conn.Exec(`INSERT INTO uniq_test (id, code) VALUES ('b', 'c1')`)
+	if !IsUniqueConstraint(uniqErr, "uniq_test.code") || IsUniqueConstraint(uniqErr, "uniq_test.id") {
+		t.Fatalf("unique column conflict check failed: err=%v", uniqErr)
+	}
+}

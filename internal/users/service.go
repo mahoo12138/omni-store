@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/models"
 )
 
@@ -36,7 +37,8 @@ var usernameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,32}$`)
 
 // Service 提供用户管理能力。
 type Service struct {
-	db *sql.DB
+	db  *sql.DB
+	rdb *sql.DB
 }
 
 // RevokedCredentials 汇总一次账号凭据撤销实际删除的记录数。
@@ -52,10 +54,22 @@ func NewService(db *sql.DB) *Service {
 	return &Service{db: db}
 }
 
+// SetReadDB 注入只读连接池，供用户信息与计数查询并发执行。
+func (s *Service) SetReadDB(rdb *sql.DB) {
+	s.rdb = rdb
+}
+
+func (s *Service) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
+}
+
 // Count 返回用户总数，用于判断是否进入初始化模式。
 func (s *Service) Count() (int64, error) {
 	var n int64
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	err := s.readDB().QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
 	return n, err
 }
 
@@ -75,11 +89,10 @@ func (s *Service) Create(username, displayName, password, role string) (*models.
   VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
 			publicID, username, displayName, hash, role, now, now)
 		if err != nil {
-			msg := err.Error()
-			if strings.Contains(msg, "users.username") {
+			if db.IsUniqueConstraint(err, "users.username") {
 				return nil, ErrUsernameTaken
 			}
-			if strings.Contains(msg, "users.user_public_id") {
+			if db.IsUniqueConstraint(err, "users.user_public_id") {
 				continue
 			}
 			return nil, fmt.Errorf("创建用户失败: %w", err)
@@ -108,7 +121,7 @@ func (s *Service) CreateFirstAdmin(username, displayName, password string) (*mod
   WHERE NOT EXISTS (SELECT 1 FROM users)`,
 			publicID, username, displayName, hash, models.RoleSuperAdmin, now, now)
 		if err != nil {
-			if strings.Contains(err.Error(), "users.user_public_id") {
+			if db.IsUniqueConstraint(err, "users.user_public_id") {
 				continue
 			}
 			return nil, fmt.Errorf("创建首个管理员失败: %w", err)
@@ -188,7 +201,7 @@ func (s *Service) BindOIDC(userID int64, issuer, subject string) error {
 		issuer, subject, time.Now().UTC(), userID, issuer, subject, userID)
 	if err != nil {
 		// SQLite 唯一约束报错携带列名而非索引名。
-		if strings.Contains(err.Error(), "users.oidc_iss") {
+		if db.IsUniqueConstraint(err, "users.oidc_iss") {
 			return ErrOIDCIdentityTaken
 		}
 		return err
@@ -457,7 +470,7 @@ func (s *Service) updatePassword(id int64, newPassword, keepSessionID string) er
 	if keepSessionID == "" {
 		_, err = tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, id)
 	} else {
-		_, err = tx.Exec(`DELETE FROM sessions WHERE user_id = ? AND session_id <> ?`, id, keepSessionID)
+		_, err = tx.Exec(`DELETE FROM sessions WHERE user_id = ? AND session_id <> ?`, id, auth.HashToken(keepSessionID))
 	}
 	if err != nil {
 		return err

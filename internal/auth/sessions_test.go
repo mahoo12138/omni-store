@@ -45,9 +45,20 @@ func TestSessionLifecycleCSRFAndInvalidation(t *testing.T) {
 		t.Fatal("CSRF verification contract failed")
 	}
 
-	var storedCSRFHash string
-	if err := conn.QueryRow(`SELECT csrf_token_hash FROM sessions WHERE session_id = ?`, sessionID).Scan(&storedCSRFHash); err != nil {
+	// 数据库中只能保存 SHA-256(session_id)，不能存明文 session_id。
+	var storedCount int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM sessions WHERE session_id = ?`, sessionID).Scan(&storedCount); err != nil {
 		t.Fatal(err)
+	}
+	if storedCount != 0 {
+		t.Fatal("plaintext session_id was stored in database")
+	}
+	var hashedCount int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM sessions WHERE session_id = ?`, auth.HashToken(sessionID)).Scan(&hashedCount); err != nil {
+		t.Fatal(err)
+	}
+	if hashedCount != 1 {
+		t.Fatalf("hashed session_id rows=%d want 1", hashedCount)
 	}
 	if recovered := sessions.CSRFToken(sessionID); recovered != csrf {
 		t.Fatalf("CSRFToken()=%q, want original token %q", recovered, csrf)
@@ -73,13 +84,6 @@ func TestSessionLifecycleCSRFAndInvalidation(t *testing.T) {
 	for recovered := range errCh {
 		t.Errorf("concurrent CSRFToken()=%q, want %q", recovered, csrf)
 	}
-	var currentCSRFHash string
-	if err := conn.QueryRow(`SELECT csrf_token_hash FROM sessions WHERE session_id = ?`, sessionID).Scan(&currentCSRFHash); err != nil {
-		t.Fatal(err)
-	}
-	if currentCSRFHash != storedCSRFHash {
-		t.Fatalf("recovering CSRF token changed stored hash: before=%q after=%q", storedCSRFHash, currentCSRFHash)
-	}
 
 	if _, _, err := sessions.Validate(""); !errors.Is(err, auth.ErrSessionInvalid) {
 		t.Fatalf("empty session error=%v", err)
@@ -92,7 +96,7 @@ func TestSessionLifecycleCSRFAndInvalidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Exec(`UPDATE sessions SET expires_at = ? WHERE session_id = ?`, time.Now().UTC().Add(-time.Minute), expiredID); err != nil {
+	if _, err := conn.Exec(`UPDATE sessions SET expires_at = ? WHERE session_id = ?`, time.Now().UTC().Add(-time.Minute), auth.HashToken(expiredID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := sessions.Validate(expiredID); !errors.Is(err, auth.ErrSessionInvalid) {

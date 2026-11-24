@@ -32,14 +32,14 @@ func (u *User) IsAdmin() bool {
 	return u.Role == RoleSuperAdmin
 }
 
-// Session 对应 sessions 表。
+// Session 对应 sessions 表；SessionID 仅在内存中保存原始凭据以便派生 CSRF Token，
+// 数据库持久化时仅保存其 SHA-256 哈希。
 type Session struct {
-	SessionID     string
-	UserID        int64
-	CSRFTokenHash string
-	ExpiresAt     time.Time
-	CreatedAt     time.Time
-	LastSeenAt    time.Time
-	UserAgent     string
-	IPAddress     string
+	SessionID  string
+	UserID     int64
+	ExpiresAt  time.Time
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	UserAgent  string
+	IPAddress  string
 }

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/models"
 )
 
@@ -31,15 +33,54 @@ var (
 // MaxImageBedTokens 是每个用户可同时持有的图床 Token 上限。
 const MaxImageBedTokens = 10
 
+const tokenLastUsedThrottle = time.Minute
+
 // Tokens 管理用户 WebDAV Token 和图床 API Token。
 // WebDAV 每用户一个；图床 Token 可命名并创建多个。两者都只保存哈希。
 type Tokens struct {
-	db *sql.DB
+	db          *sql.DB
+	rdb         *sql.DB
+	touchMu     sync.Mutex
+	lastTouched map[string]time.Time
 }
 
 // NewTokens 创建 Token 服务。
 func NewTokens(db *sql.DB) *Tokens {
-	return &Tokens{db: db}
+	return &Tokens{db: db, lastTouched: make(map[string]time.Time)}
+}
+
+// SetReadDB 注入只读连接池用于热路径 Token 校验查询。
+func (t *Tokens) SetReadDB(rdb *sql.DB) {
+	t.rdb = rdb
+}
+
+func (t *Tokens) readDB() *sql.DB {
+	if t.rdb != nil {
+		return t.rdb
+	}
+	return t.db
+}
+
+func (t *Tokens) shouldTouchLastUsed(key string, dbLastUsed sql.NullTime, now time.Time) bool {
+	if dbLastUsed.Valid && now.Sub(dbLastUsed.Time) < tokenLastUsedThrottle {
+		return false
+	}
+	t.touchMu.Lock()
+	defer t.touchMu.Unlock()
+	if t.lastTouched == nil {
+		t.lastTouched = make(map[string]time.Time)
+	}
+	// 数据库尚无使用时间时（如刚创建或重置）允许立即落盘一次，随后按 60s 节流。
+	if dbLastUsed.Valid {
+		if prev, ok := t.lastTouched[key]; ok && now.Sub(prev) < tokenLastUsedThrottle {
+			return false
+		}
+	}
+	if len(t.lastTouched) >= 4096 {
+		clear(t.lastTouched)
+	}
+	t.lastTouched[key] = now
+	return true
 }
 
 // Reset 兼容单 Token 重置接口，返回明文（只展示一次）。
@@ -101,7 +142,7 @@ func insertImageBedToken(exec tokenExecer, userID int64, label string) (*ImageBe
 		if err == nil {
 			return &ImageBedToken{TokenID: tokenID, Label: label, CreatedAt: now}, plaintext, nil
 		}
-		if !strings.Contains(err.Error(), "image_bed_tokens.token_id") {
+		if !db.IsUniqueConstraint(err, "image_bed_tokens.token_id") {
 			return nil, "", fmt.Errorf("创建图床 Token 失败: %w", err)
 		}
 	}
@@ -197,16 +238,17 @@ func (t *Tokens) Verify(username, tokenType, plaintext string) (*models.User, er
 	if username == "" || plaintext == "" {
 		return nil, ErrTokenInvalid
 	}
-	row := t.db.QueryRow(`SELECT
+	row := t.readDB().QueryRow(`SELECT
     u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled, u.created_at, u.updated_at,
-    t.token_hash
+    t.token_hash, t.last_used_at
   FROM users u JOIN user_tokens t ON t.user_id = u.id
   WHERE u.username = ? AND t.token_type = ?`, username, tokenType)
 
 	var u models.User
 	var hash string
+	var lastUsed sql.NullTime
 	err := row.Scan(&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role,
-		&u.IsDisabled, &u.CreatedAt, &u.UpdatedAt, &hash)
+		&u.IsDisabled, &u.CreatedAt, &u.UpdatedAt, &hash, &lastUsed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTokenInvalid
 	}
@@ -217,8 +259,11 @@ func (t *Tokens) Verify(username, tokenType, plaintext string) (*models.User, er
 		return nil, ErrTokenInvalid
 	}
 
-	_, _ = t.db.Exec(`UPDATE user_tokens SET last_used_at = ? WHERE user_id = ? AND token_type = ?`,
-		time.Now().UTC(), u.ID, tokenType)
+	now := time.Now().UTC()
+	if t.shouldTouchLastUsed(fmt.Sprintf("ut:%d:%s", u.ID, tokenType), lastUsed, now) {
+		_, _ = t.db.Exec(`UPDATE user_tokens SET last_used_at = ? WHERE user_id = ? AND token_type = ?`,
+			now, u.ID, tokenType)
+	}
 	return &u, nil
 }
 
@@ -231,14 +276,16 @@ func (t *Tokens) VerifyByToken(tokenType, plaintext string) (*models.User, error
 	if tokenType == TokenTypeImageBed {
 		return t.verifyImageBedToken(plaintext)
 	}
-	row := t.db.QueryRow(`SELECT
-    u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled, u.created_at, u.updated_at
+	row := t.readDB().QueryRow(`SELECT
+    u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled, u.created_at, u.updated_at,
+    t.last_used_at
   FROM users u JOIN user_tokens t ON t.user_id = u.id
   WHERE t.token_type = ? AND t.token_hash = ?`, tokenType, HashToken(plaintext))
 
 	var u models.User
+	var lastUsed sql.NullTime
 	err := row.Scan(&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role,
-		&u.IsDisabled, &u.CreatedAt, &u.UpdatedAt)
+		&u.IsDisabled, &u.CreatedAt, &u.UpdatedAt, &lastUsed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTokenInvalid
 	}
@@ -248,22 +295,26 @@ func (t *Tokens) VerifyByToken(tokenType, plaintext string) (*models.User, error
 	if u.IsDisabled {
 		return nil, ErrTokenInvalid
 	}
-	_, _ = t.db.Exec(`UPDATE user_tokens SET last_used_at = ? WHERE user_id = ? AND token_type = ?`,
-		time.Now().UTC(), u.ID, tokenType)
+	now := time.Now().UTC()
+	if t.shouldTouchLastUsed(fmt.Sprintf("ut:%d:%s", u.ID, tokenType), lastUsed, now) {
+		_, _ = t.db.Exec(`UPDATE user_tokens SET last_used_at = ? WHERE user_id = ? AND token_type = ?`,
+			now, u.ID, tokenType)
+	}
 	return &u, nil
 }
 
 func (t *Tokens) verifyImageBedToken(plaintext string) (*models.User, error) {
-	row := t.db.QueryRow(`SELECT
+	row := t.readDB().QueryRow(`SELECT
     u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled, u.created_at, u.updated_at,
-    t.token_id
+    t.token_id, t.last_used_at
   FROM users u JOIN image_bed_tokens t ON t.user_id = u.id
   WHERE t.token_hash = ?`, HashToken(plaintext))
 
 	var u models.User
 	var tokenID string
+	var lastUsed sql.NullTime
 	err := row.Scan(&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role,
-		&u.IsDisabled, &u.CreatedAt, &u.UpdatedAt, &tokenID)
+		&u.IsDisabled, &u.CreatedAt, &u.UpdatedAt, &tokenID, &lastUsed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTokenInvalid
 	}
@@ -273,8 +324,11 @@ func (t *Tokens) verifyImageBedToken(plaintext string) (*models.User, error) {
 	if u.IsDisabled {
 		return nil, ErrTokenInvalid
 	}
-	_, _ = t.db.Exec(`UPDATE image_bed_tokens SET last_used_at = ? WHERE token_id = ?`,
-		time.Now().UTC(), tokenID)
+	now := time.Now().UTC()
+	if t.shouldTouchLastUsed("ibt:"+tokenID, lastUsed, now) {
+		_, _ = t.db.Exec(`UPDATE image_bed_tokens SET last_used_at = ? WHERE token_id = ?`,
+			now, tokenID)
+	}
 	return &u, nil
 }
 

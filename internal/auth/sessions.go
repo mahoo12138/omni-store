@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/omni-store/omnistore/internal/models"
@@ -15,18 +16,62 @@ import (
 // SessionCookieName 是登录态 Cookie 名称。
 const SessionCookieName = "omnistore_session"
 
+const sessionLastSeenThrottle = time.Minute
+
 // ErrSessionInvalid 表示 Session 不存在、已过期或用户不可用。
 var ErrSessionInvalid = errors.New("session 无效")
 
 // Sessions 管理 SQLite 中的登录 Session。
 type Sessions struct {
-	db  *sql.DB
-	ttl time.Duration
+	db          *sql.DB
+	rdb         *sql.DB
+	ttl         time.Duration
+	touchMu     sync.Mutex
+	lastTouched map[string]time.Time
 }
 
 // NewSessions 创建 Session 服务，ttl 为登录有效期。
 func NewSessions(db *sql.DB, ttl time.Duration) *Sessions {
-	return &Sessions{db: db, ttl: ttl}
+	return &Sessions{db: db, ttl: ttl, lastTouched: make(map[string]time.Time)}
+}
+
+// SetReadDB 注入只读连接池，使热路径会话校验不阻塞在单连接写池上。
+func (s *Sessions) SetReadDB(rdb *sql.DB) {
+	s.rdb = rdb
+}
+
+func (s *Sessions) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
+}
+
+func (s *Sessions) shouldTouchLastSeen(sessionHash string, dbLastSeen, now time.Time) bool {
+	if now.Sub(dbLastSeen) < sessionLastSeenThrottle {
+		return false
+	}
+	s.touchMu.Lock()
+	defer s.touchMu.Unlock()
+	if s.lastTouched == nil {
+		s.lastTouched = make(map[string]time.Time)
+	}
+	if prev, ok := s.lastTouched[sessionHash]; ok && now.Sub(prev) < sessionLastSeenThrottle {
+		return false
+	}
+	if len(s.lastTouched) >= 4096 {
+		cutoff := now.Add(-sessionLastSeenThrottle)
+		for k, v := range s.lastTouched {
+			if v.Before(cutoff) {
+				delete(s.lastTouched, k)
+			}
+		}
+		if len(s.lastTouched) >= 4096 {
+			clear(s.lastTouched)
+		}
+	}
+	s.lastTouched[sessionHash] = now
+	return true
 }
 
 // TTL 返回 Session 有效期。
@@ -34,17 +79,17 @@ func (s *Sessions) TTL() time.Duration {
 	return s.ttl
 }
 
-// Create 为用户创建 Session，返回 session_id 和明文 CSRF Token。
-// CSRF Token 只保存哈希。
+// Create 为用户创建 Session，返回原始 session_id 和明文 CSRF Token。
+// 数据库中仅保存 SHA-256(session_id)，不落盘明文凭据；CSRF Token 按需确定性派生。
 func (s *Sessions) Create(userID int64, userAgent, ipAddress string) (sessionID, csrfToken string, err error) {
 	sessionID = NewRandomToken("", 32)
 	csrfToken = csrfTokenForSession(sessionID)
 	now := time.Now().UTC()
 
 	_, err = s.db.Exec(`INSERT INTO sessions
-  (session_id, user_id, csrf_token_hash, expires_at, created_at, last_seen_at, user_agent, ip_address)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, userID, HashToken(csrfToken), now.Add(s.ttl), now, now, userAgent, ipAddress)
+  (session_id, user_id, expires_at, created_at, last_seen_at, user_agent, ip_address)
+  VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		HashToken(sessionID), userID, now.Add(s.ttl), now, now, userAgent, ipAddress)
 	if err != nil {
 		return "", "", fmt.Errorf("创建 session 失败: %w", err)
 	}
@@ -65,17 +110,18 @@ func (s *Sessions) Validate(sessionID string) (*models.User, *models.Session, er
 	if sessionID == "" {
 		return nil, nil, ErrSessionInvalid
 	}
-	row := s.db.QueryRow(`SELECT
-    s.session_id, s.user_id, s.csrf_token_hash, s.expires_at,
+	sessionHash := HashToken(sessionID)
+	row := s.readDB().QueryRow(`SELECT
+    s.user_id, s.expires_at, s.last_seen_at,
     u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled,
     u.email, u.oidc_iss, u.oidc_sub, u.created_at, u.updated_at
   FROM sessions s JOIN users u ON u.id = s.user_id
-  WHERE s.session_id = ?`, sessionID)
+  WHERE s.session_id = ?`, sessionHash)
 
 	var sess models.Session
 	var u models.User
 	err := row.Scan(
-		&sess.SessionID, &sess.UserID, &sess.CSRFTokenHash, &sess.ExpiresAt,
+		&sess.UserID, &sess.ExpiresAt, &sess.LastSeenAt,
 		&u.ID, &u.UserPublicID, &u.Username, &u.DisplayName, &u.Role, &u.IsDisabled,
 		&u.Email, &u.OIDCIssuer, &u.OIDCSubject, &u.CreatedAt, &u.UpdatedAt,
 	)
@@ -85,23 +131,28 @@ func (s *Sessions) Validate(sessionID string) (*models.User, *models.Session, er
 	if err != nil {
 		return nil, nil, fmt.Errorf("查询 session 失败: %w", err)
 	}
-	if time.Now().UTC().After(sess.ExpiresAt) || u.IsDisabled {
+	now := time.Now().UTC()
+	if now.After(sess.ExpiresAt) || u.IsDisabled {
 		return nil, nil, ErrSessionInvalid
 	}
+	// 内存中保留原始 sessionID 供 CSRF 派生与密码修改保留当前会话使用，不回写明文到 DB。
+	sess.SessionID = sessionID
 	u.SSOBound = u.OIDCSubject != ""
 
-	// 更新活跃时间，失败不影响本次请求。
-	_, _ = s.db.Exec(`UPDATE sessions SET last_seen_at = ? WHERE session_id = ?`,
-		time.Now().UTC(), sessionID)
+	// 活跃时间节流写库（距上次 > 60s 且内存中去重），减少热路径写竞争。
+	if s.shouldTouchLastSeen(sessionHash, sess.LastSeenAt, now) {
+		_, _ = s.db.Exec(`UPDATE sessions SET last_seen_at = ? WHERE session_id = ?`,
+			now, sessionHash)
+	}
 	return &u, &sess, nil
 }
 
-// VerifyCSRF 校验明文 CSRF Token 与 Session 中的哈希。
+// VerifyCSRF 重新派生该 Session 的期望 CSRF Token 并做常量时间比较。
 func (s *Sessions) VerifyCSRF(sess *models.Session, csrfToken string) bool {
-	if csrfToken == "" {
+	if sess == nil || sess.SessionID == "" || csrfToken == "" {
 		return false
 	}
-	return TokenEqual(sess.CSRFTokenHash, HashToken(csrfToken))
+	return TokenEqual(csrfTokenForSession(sess.SessionID), csrfToken)
 }
 
 // CSRFToken 返回指定 Session 的稳定 CSRF Token，不读写数据库。
@@ -115,7 +166,7 @@ func (s *Sessions) CSRFToken(sessionID string) string {
 
 // Delete 删除指定 Session（退出登录）。
 func (s *Sessions) Delete(sessionID string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE session_id = ?`, sessionID)
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE session_id = ?`, HashToken(sessionID))
 	return err
 }
 

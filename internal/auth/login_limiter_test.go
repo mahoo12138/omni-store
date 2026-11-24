@@ -162,3 +162,65 @@ func TestLoginLimiterSweepsExpiredAndCapsTrackedKeys(t *testing.T) {
 		t.Fatalf("expired keys were not swept: ip=%d username=%d", len(limiter.byIP), len(limiter.byUsername))
 	}
 }
+
+func TestLoginLimiterUsernameSprayCannotFlushVictim(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	limiter := NewLoginLimiter(10*time.Minute, 100, 2)
+	limiter.maxTrackedKeys = 3
+	limiter.now = func() time.Time { return now }
+
+	// 受害账号先累计 2 次失败达到用户名限流上限。
+	for i := range 2 {
+		attempt, _, ok := limiter.Begin("198.51.100."+string(rune('1'+i)), "victim")
+		if !ok {
+			t.Fatalf("victim attempt %d rejected", i)
+		}
+		if _, allowed := limiter.Failure(attempt); !allowed {
+			t.Fatalf("victim failure %d unexpectedly rate-limited early", i)
+		}
+	}
+
+	// 攻击者喷洒远超 maxTrackedKeys 的随机用户名，试图驱逐 victim 的失败计数。
+	for i := range 20 {
+		attempt, _, ok := limiter.Begin("203.0.113.1", "spray-"+string(rune('a'+i)))
+		if !ok {
+			t.Fatalf("spray IP attempt %d rejected", i)
+		}
+		limiter.Failure(attempt)
+	}
+	if len(limiter.byUsername) > 3 {
+		t.Fatalf("username map exceeded cap: %d", len(limiter.byUsername))
+	}
+
+	// victim 的失败计数必须完整保留，下一次错误密码仍应被限流。
+	probe, _, ok := limiter.Begin("198.51.100.99", "victim")
+	if !ok {
+		t.Fatal("probe begin rejected")
+	}
+	if retry, allowed := limiter.Failure(probe); allowed || retry <= 0 {
+		t.Fatalf("victim failure count was flushed by username spray: allowed=%v retry=%v", allowed, retry)
+	}
+}
+
+func TestLoginLimiterIPSprayCannotFlushRateLimitedIP(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	limiter := NewLoginLimiter(10*time.Minute, 2, 10)
+	limiter.maxTrackedKeys = 2
+	limiter.now = func() time.Time { return now }
+
+	// 两个攻击 IP 全部触发限流。
+	for _, ip := range []string{"198.51.100.1", "198.51.100.2"} {
+		for range 2 {
+			if _, _, ok := limiter.Begin(ip, "alice"); !ok {
+				t.Fatalf("initial attempt for %s rejected", ip)
+			}
+		}
+	}
+	// 满表且全部已触发限流时，新 IP 无法冲刷既有封禁 IP。
+	if _, retry, ok := limiter.Begin("198.51.100.3", "alice"); ok || retry <= 0 {
+		t.Fatalf("expected fail-closed when all tracked IPs are rate-limited: ok=%v retry=%v", ok, retry)
+	}
+	if _, _, ok := limiter.Begin("198.51.100.1", "alice"); ok {
+		t.Fatal("rate-limited IP was evicted")
+	}
+}

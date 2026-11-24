@@ -4,12 +4,73 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	_ "modernc.org/sqlite"
 )
+
+// Pool 维护 SQLite WAL 读写分池：写池单连接避免 database is locked，
+// 读池多连接（query_only=1）支撑高并发只读查询不被写事务或 Reconcile 阻塞。
+type Pool struct {
+	write *sql.DB
+	read  *sql.DB
+}
+
+// Write 返回单连接写池。
+func (p *Pool) Write() *sql.DB { return p.write }
+
+// Read 返回多连接只读池。
+func (p *Pool) Read() *sql.DB { return p.read }
+
+// Close 关闭读写两个连接池。
+func (p *Pool) Close() error {
+	var err error
+	if p.read != nil {
+		err = errors.Join(err, p.read.Close())
+	}
+	if p.write != nil {
+		err = errors.Join(err, p.write.Close())
+	}
+	return err
+}
+
+// OpenPool 打开（必要时创建）SQLite 数据库、执行迁移并返回读写分池。
+func OpenPool(dbPath string) (*Pool, error) {
+	writeConn, err := Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	readConn, err := OpenReadOnly(dbPath)
+	if err != nil {
+		_ = writeConn.Close()
+		return nil, err
+	}
+	return &Pool{write: writeConn, read: readConn}, nil
+}
+
+// OpenReadOnly 打开指向已初始化 SQLite 数据库的多连接只读池（WAL 并发读）。
+func OpenReadOnly(dbPath string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", filepath.ToSlash(dbPath))
+	conn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("打开只读数据库连接池失败: %w", err)
+	}
+	readConns := runtime.NumCPU()
+	if readConns < 4 {
+		readConns = 4
+	}
+	conn.SetMaxOpenConns(readConns)
+	conn.SetMaxIdleConns(readConns)
+	if err := conn.Ping(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("连接只读数据库失败: %w", err)
+	}
+	return conn, nil
+}
 
 // Open 打开（必要时创建）SQLite 数据库并应用迁移。
 func Open(dbPath string) (*sql.DB, error) {
@@ -17,8 +78,8 @@ func Open(dbPath string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	// busy_timeout 缓解单实例内并发写；WAL 提升读写并发。
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", filepath.ToSlash(dbPath))
+	// busy_timeout 缓解单实例内并发写；WAL + synchronous=NORMAL 兼顾崩溃安全与写入吞吐。
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)", filepath.ToSlash(dbPath))
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
@@ -26,6 +87,7 @@ func Open(dbPath string) (*sql.DB, error) {
 
 	// SQLite 单写者，限制连接数避免 database is locked。
 	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
 
 	if err := conn.Ping(); err != nil {
 		conn.Close()

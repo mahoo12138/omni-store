@@ -78,14 +78,23 @@ func (l *LoginLimiter) Begin(ip, username string) (*LoginAttempt, time.Duration,
 	l.nextID++
 	attempt := &LoginAttempt{id: l.nextID, ip: ip, username: username}
 	if l.maxPerIP > 0 {
+		if _, exists := l.byIP[ip]; !exists && l.maxTrackedKeys > 0 && len(l.byIP) >= l.maxTrackedKeys {
+			l.sweep(l.byIP, cutoff)
+			if len(l.byIP) >= l.maxTrackedKeys {
+				if !l.evictNonLimitedIP(l.byIP) {
+					return nil, earliestRetry(l.byIP, now, l.window), false
+				}
+			}
+		}
 		l.byIP[ip] = append(ipEvents, loginAttemptEvent{id: attempt.id, at: now})
-		l.capTrackedKeys(l.byIP)
 	}
 	return attempt, 0, true
 }
 
 // Failure 保留 Begin 预占的 IP 失败，并在凭据验证失败后记录用户名维度。
 // 超过用户名阈值的错误请求返回 allowed=false，但同用户名的正确密码仍可进入 Success。
+// 当跟踪表已满且全为未过期失败记录时，绝不驱逐既有账号的失败计数（防用户名喷洒冲刷），
+// 直接对新用户名 fail-closed 拒绝。
 func (l *LoginLimiter) Failure(attempt *LoginAttempt) (time.Duration, bool) {
 	if attempt == nil {
 		return 0, true
@@ -98,7 +107,8 @@ func (l *LoginLimiter) Failure(attempt *LoginAttempt) (time.Duration, bool) {
 
 	now := l.now()
 	l.maintain(now)
-	events := pruneLoginEvents(l.byUsername[attempt.username], now.Add(-l.window))
+	cutoff := now.Add(-l.window)
+	events := pruneLoginEvents(l.byUsername[attempt.username], cutoff)
 	allowed := len(events) < l.maxPerUsername
 	retryAfter := time.Duration(0)
 	if !allowed {
@@ -106,8 +116,14 @@ func (l *LoginLimiter) Failure(attempt *LoginAttempt) (time.Duration, bool) {
 		l.storeEvents(l.byUsername, attempt.username, events)
 		return retryAfter, false
 	}
+	if _, exists := l.byUsername[attempt.username]; !exists && l.maxTrackedKeys > 0 && len(l.byUsername) >= l.maxTrackedKeys {
+		l.sweep(l.byUsername, cutoff)
+		if len(l.byUsername) >= l.maxTrackedKeys {
+			// 表中全部条目仍处于活跃失败窗口内：保留既有受害账号计数，对未知新键直接限流。
+			return earliestRetry(l.byUsername, now, l.window), false
+		}
+	}
 	l.byUsername[attempt.username] = append(events, loginAttemptEvent{id: attempt.id, at: now})
-	l.capTrackedKeys(l.byUsername)
 	return 0, true
 }
 
@@ -152,23 +168,48 @@ func (l *LoginLimiter) sweep(target map[string][]loginAttemptEvent, cutoff time.
 	}
 }
 
-func (l *LoginLimiter) capTrackedKeys(target map[string][]loginAttemptEvent) {
-	for l.maxTrackedKeys > 0 && len(target) > l.maxTrackedKeys {
-		oldestKey := ""
-		var oldest time.Time
-		for key, events := range target {
-			if len(events) == 0 {
-				oldestKey = key
-				break
-			}
-			candidate := events[len(events)-1].at
-			if oldestKey == "" || candidate.Before(oldest) {
-				oldestKey = key
-				oldest = candidate
-			}
+// evictNonLimitedIP 仅在 IP 表满且无过期项时驱逐一个尚未触发限流且失败次数最少、最久未活跃的 IP，
+// 绝不驱逐已经达到 maxPerIP 的限流 IP，防止攻击者通过喷洒新 IP 洗白被封禁来源。
+func (l *LoginLimiter) evictNonLimitedIP(target map[string][]loginAttemptEvent) bool {
+	victimKey := ""
+	victimCount := 0
+	var victimLast time.Time
+	for key, events := range target {
+		if len(events) == 0 {
+			delete(target, key)
+			return true
 		}
-		delete(target, oldestKey)
+		if l.maxPerIP > 0 && len(events) >= l.maxPerIP {
+			continue
+		}
+		lastAt := events[len(events)-1].at
+		if victimKey == "" || len(events) < victimCount || (len(events) == victimCount && lastAt.Before(victimLast)) {
+			victimKey = key
+			victimCount = len(events)
+			victimLast = lastAt
+		}
 	}
+	if victimKey == "" {
+		return false
+	}
+	delete(target, victimKey)
+	return true
+}
+
+func earliestRetry(target map[string][]loginAttemptEvent, now time.Time, window time.Duration) time.Duration {
+	var earliest time.Time
+	for _, events := range target {
+		if len(events) == 0 {
+			continue
+		}
+		if earliest.IsZero() || events[0].at.Before(earliest) {
+			earliest = events[0].at
+		}
+	}
+	if earliest.IsZero() {
+		return window
+	}
+	return retryDuration(now, earliest, window)
 }
 
 func (l *LoginLimiter) storeEvents(target map[string][]loginAttemptEvent, key string, events []loginAttemptEvent) {

@@ -228,6 +228,7 @@ func sanitizeSnapshotDatabase(ctx context.Context, target string) error {
 		`DELETE FROM s3_multipart_parts`,
 		`DELETE FROM s3_multipart_uploads`,
 		`DELETE FROM trash_entries`,
+		`DELETE FROM source_usage`,
 	} {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			_ = tx.Rollback()

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
@@ -25,15 +26,45 @@ type migrationFile struct {
 	version semanticVersion
 }
 
+func compareSemanticVersion(left, right semanticVersion) int {
+	if left.major != right.major {
+		if left.major < right.major {
+			return -1
+		}
+		return 1
+	}
+	if left.minor != right.minor {
+		if left.minor < right.minor {
+			return -1
+		}
+		return 1
+	}
+	if left.patch != right.patch {
+		if left.patch < right.patch {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
 // Migrate applies each SemVer migration exactly once and records the version in
 // schema_migrations. Applied files are immutable: schema changes must be added
 // as a new vMAJOR.MINOR.PATCH.sql file instead of editing or replaying history.
 //
-// 迁移期间按 SQLite 官方重建流程关闭外键强制（PRAGMA foreign_keys 是事务内
+// 迁移期间固定单条 SQLite 连接并关闭外键强制（PRAGMA foreign_keys 是事务内
 // no-op，必须在事务外切换），避免重建带子表引用的表时触发级联删除；
 // 全部迁移结束后用 foreign_key_check 校验完整性并恢复强制。
+// 如果数据库中存在高于或未知于当前二进制内置版本的迁移，拒绝启动以防止降级破坏。
 func Migrate(conn *sql.DB) error {
-	if _, err := conn.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+	ctx := context.Background()
+	pinned, err := conn.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("获取迁移数据库连接失败: %w", err)
+	}
+	defer pinned.Close()
+
+	if _, err := pinned.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY,
   applied_at DATETIME NOT NULL
 )`); err != nil {
@@ -41,7 +72,7 @@ func Migrate(conn *sql.DB) error {
 	}
 
 	applied := map[string]bool{}
-	rows, err := conn.Query(`SELECT version FROM schema_migrations`)
+	rows, err := pinned.QueryContext(ctx, `SELECT version FROM schema_migrations`)
 	if err != nil {
 		return fmt.Errorf("读取迁移版本失败: %w", err)
 	}
@@ -64,6 +95,30 @@ func Migrate(conn *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	known := make(map[string]bool, len(files))
+	var maxEmbedded semanticVersion
+	for _, file := range files {
+		known[strings.TrimSuffix(file.name, ".sql")] = true
+		maxEmbedded = file.version
+	}
+	// 降级保护：数据库包含当前二进制未知或更新版本的迁移时拒绝启动。
+	unknownVersions := make([]string, 0)
+	for version := range applied {
+		if known[version] {
+			continue
+		}
+		if parsed, parseErr := parseMigrationFilename(version + ".sql"); parseErr == nil &&
+			len(files) > 0 && compareSemanticVersion(parsed, maxEmbedded) > 0 {
+			return fmt.Errorf("数据库迁移版本 %s 高于当前二进制支持的最高版本 %s，禁止降级启动",
+				version, strings.TrimSuffix(files[len(files)-1].name, ".sql"))
+		}
+		unknownVersions = append(unknownVersions, version)
+	}
+	if len(unknownVersions) > 0 {
+		sort.Strings(unknownVersions)
+		return fmt.Errorf("数据库包含当前二进制未识别的迁移版本 %s，拒绝启动", strings.Join(unknownVersions, ", "))
+	}
+
 	pending := make([]migrationFile, 0, len(files))
 	for _, file := range files {
 		if !applied[strings.TrimSuffix(file.name, ".sql")] {
@@ -74,24 +129,27 @@ func Migrate(conn *sql.DB) error {
 		return nil
 	}
 
-	// 单连接设置下该 PRAGMA 会落在后续事务使用的同一连接上。
-	if _, err := conn.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+	if _, err := pinned.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
 		return fmt.Errorf("迁移前关闭外键强制失败: %w", err)
 	}
+	defer func() {
+		_, _ = pinned.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
+	}()
+
 	for _, file := range pending {
 		sqlBytes, err := migrations.FS.ReadFile(file.name)
 		if err != nil {
 			return fmt.Errorf("读取迁移 %s 失败: %w", file.name, err)
 		}
-		tx, err := conn.Begin()
+		tx, err := pinned.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(string(sqlBytes)); err != nil {
+		if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("执行迁移 %s 失败: %w", file.name, err)
 		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
 			strings.TrimSuffix(file.name, ".sql"), time.Now().UTC()); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("记录迁移版本 %s 失败: %w", file.name, err)
@@ -100,25 +158,25 @@ func Migrate(conn *sql.DB) error {
 			return fmt.Errorf("提交迁移 %s 失败: %w", file.name, err)
 		}
 	}
-	if _, err := conn.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+	if _, err := pinned.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
 		return fmt.Errorf("恢复外键强制失败: %w", err)
 	}
-	if err := verifyForeignKeyIntegrity(conn); err != nil {
+	if err := verifyForeignKeyIntegrity(ctx, pinned); err != nil {
 		return err
 	}
 	return nil
 }
 
 // verifyForeignKeyIntegrity 在迁移后确认没有悬空引用，防止迁移副本漏行。
-func verifyForeignKeyIntegrity(conn *sql.DB) error {
-	rows, err := conn.Query(`PRAGMA foreign_key_check`)
+func verifyForeignKeyIntegrity(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `PRAGMA foreign_key_check`)
 	if err != nil {
 		return fmt.Errorf("外键完整性检查失败: %w", err)
 	}
 	defer rows.Close()
 	var table string
 	if rows.Next() {
-		if err := rows.Scan(&table, new(any), new(any)); err != nil {
+		if err := rows.Scan(&table, new(any), new(any), new(any)); err != nil {
 			rows.Close()
 			return err
 		}
