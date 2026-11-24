@@ -159,24 +159,21 @@ bucket = storage_key
 
 ## 7. File Write Pipeline
 
-通用 durable write：
+通用 durable write（两阶段无锁落盘 + 短临界区提交）：
 
 ```text
 Auth / Capability
-→ Normalize
-→ Reserved namespace
-→ Exclude
-→ Symlink safety
-→ Lock
-→ Quota
-→ planned journal
-→ temp + fsync
-→ prepared
-→ publish
-→ DB transaction
-→ database-ready
-→ cleanup
+→ Normalize / Reserved namespace / Exclude
+→ Optimistic quota bound (Phase 0, unlocked)
+→ staging planned journal → temp write + fsync (Phase 1, unlocked)
+→ Persistent lock → Quota lock → Path lock (Phase 2, short critical section)
+→ os.Root symlink safety + conflict/quota re-verify
+→ prepared journal → atomic publish (Rename)
+→ DB transaction (+ source_usage delta + recent/favorite rebase)
+→ database-ready → cleanup
 ```
+
+下载链路在 `os.Root` 安全打开 fd 并 `Stat` 核验后立即释放路径读锁，响应流期间不持有路径锁。
 
 ## 8. Backup
 
@@ -212,3 +209,11 @@ Restore 后通过 Source Rebind 重新建立 root path。
 - [静态发布](design/static-assets.md)
 - [路径隔离](design/managed-namespace.md)
 - [公开 HTTP](design/public-content-http.md)
+
+## 12. 并发、存储与装配基线（2026-11-24）
+
+- **HTTP 超时与零拷贝**：主 HTTP Server 配置 `ReadHeaderTimeout`（10s）与 `IdleTimeout`（2m）；长传/下载通过 `http.ResponseController` 按进度滚动设置读写截止时间；`statusRecorder` 实现 `Unwrap()` 与 `io.ReaderFrom` 透传，确保 `http.ServeContent` 保留 `sendfile` 零拷贝且 `WithRecover` 放行 `http.ErrAbortHandler`。
+- **SQLite 读写分池与热路径节流**：`internal/db` 提供 `db.Pool`（写单连接 + WAL 并发只读池 `mode=ro&query_only(1)`）；Session `last_seen_at`、Token/S3 `last_used_at`、`recent_files` 写入均按 ≥60s 节流去重；`Reconcile` 在只读池读取快照并以 500 行/批提交事务。
+- **增量配额计量**：`v2.1.0` 新增 `source_usage` 表按写事务原子维护源物理字节增量，消除上传与查询热路径的全量 `WalkDir`；后台每 15 分钟无锁全源校准以自愈外部直接写盘带来的漂移。
+- **锁管理器与路径隔离**：`internal/locks.Manager` 采用每等待者独立 channel 替代 `sync.Cond.Broadcast` 并支持 `context.Context` 取消；`internal/sources` 缓存每个存储源的 `*security.SourceRoot`（`*os.Root`）。
+- **应用装配与恢复原语**：`internal/app` 统一完成依赖装配、8 套 `Recoverer` 启动恢复编排及 `context` + `WaitGroup` 管控的后台任务；`internal/lifecycle.Manager` 支持实例级注入；`internal/journal` 沉淀原子落盘、严格反序列化、幂等阶段标记与孤儿清理原语；`internal/http` 不再包含业务 SQL。

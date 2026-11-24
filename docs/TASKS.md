@@ -146,3 +146,15 @@ NS/IMG/AST 任务全部属于 2.0，不挤掉 Operation Center、Backup/Restore 
 ## 2026-10-18 — 可靠性加固
 
 - [x] 浏览器门禁使用独立临时数据、动态端口、失败留证据与中断进程清理
+
+## 2026-11-24 — 代码审查修复与架构加固
+
+- [x] 主 HTTP Server 超时配置、流式滚动 Deadline、`statusRecorder` `Unwrap`/`ReadFrom` 零拷贝与 `WithRecover` 完善
+- [x] 两阶段无锁上传（普通文件与图床）+ 路径锁每等待者 channel / `context` 取消 + 下载打开后立即释放读锁
+- [x] 增量配额表 `source_usage`（`v2.1.0`）+ 写事务原子维护 + 后台每 15 分钟无锁校准
+- [x] SQLite WAL 读写分池（`db.Pool`）、热路径写库节流（`last_seen`/`last_used`/`recent_files`）与分批 Reconcile（500 行/批）
+- [x] Session ID SHA-256 哈希落库并移除冗余 `csrf_token_hash`（`v2.1.0`）；数据库迁移降级保护与外键检查修复
+- [x] 迁移核心文件读写/删除/重命名至 `os.Root`（`security.SourceRoot`），消除软链接 TOCTOU 并补齐注入式竞态测试
+- [x] 登录限流抗驱逐加固、统一 `security.IsInternalSegment` 与大小写不敏感源锁键归一、S3 SigV4 `EscapedPath`/原始字节编码修正及流式签名文档说明
+- [x] `internal/app` 统一依赖装配/恢复编排/后台任务生命周期、`lifecycle.Manager` 实例注入、`internal/journal` 共享原语沉淀、清除 HTTP 层业务 SQL（含事务内原子迁移 `recent_files`/`favorites`）
+- [x] 前端：`api/client.ts` 安全 JSON/错误解析、自研 React 19 `ImageLightbox` 替代 `react-viewer`、清理旧迁移脚本与 `.tsbuildinfo` 忽略规则、拆分 `FileManager` / `ProfileSection` / `AppHome` 大组件
