@@ -1,10 +1,11 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useId, useState, type FormEvent, type ReactNode } from 'react'
 import { makeStyles, shorthands, tokens } from '@fluentui/react-components'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { adminGetSso, adminSetSso, adminTestSso, type SsoProbeResult } from '../../../api/sso'
 import { ApiRequestError } from '../../../api/client'
 import { Badge } from '../../../components/ui/Badge'
 import { Button } from '../../../components/ui/Button'
+import { DialogWrap } from '../../../components/ui/Dialog'
 import { Checkbox, Input } from '@fluentui/react-components'
 import { Banner } from '../../../components/shell/Banner'
 import { toastError, toastSuccess } from '../../../components/ui/Toast'
@@ -14,6 +15,11 @@ import { SectionCard } from '../SectionCard'
 import { useStyles as useSiteStyles } from './site.styles'
 
 const useStyles = makeStyles({
+  modalForm: {
+    display: 'grid',
+    ...shorthands.gap(tokens.spacingVerticalL),
+    minWidth: '0px',
+  },
   toggleHint: {
     'margin': '0px',
     'fontSize': tokens.fontSizeBase200,
@@ -36,10 +42,14 @@ const useStyles = makeStyles({
     'alignItems': 'center',
     'minWidth': '0px',
   },
+  redirectInput: {
+    flex: '1 1 0%',
+    minWidth: '0px',
+  },
 })
 
 // OIDC 单点登录（2.1.0）：配置存 system_settings，热生效，无需重启。
-// 表单模式与品牌设置一致：SectionCard + 编辑态切换 + useMutation 保存。
+// 卡片保持只读摘要，修改统一通过 DialogWrap 弹窗完成。
 export function SsoSection() {
   const css = useStyles()
   const queryClient = useQueryClient()
@@ -55,6 +65,7 @@ export function SsoSection() {
   const [msg, setMsg] = useState('')
   const [probe, setProbe] = useState<SsoProbeResult | null>(null)
   const [probing, setProbing] = useState(false)
+  const formId = useId()
 
   const save = useMutation({
     mutationFn: () => adminSetSso({
@@ -93,7 +104,14 @@ export function SsoSection() {
     setAutoCreate(!!data?.auto_create_users)
     setMsg('')
     setProbe(null)
-    setEditing((open) => !open)
+    setEditing(true)
+  }
+
+  function closeEditor() {
+    if (save.isPending) return
+    setEditing(false)
+    setMsg('')
+    setProbe(null)
   }
 
   function submit(event: FormEvent) {
@@ -104,12 +122,14 @@ export function SsoSection() {
       setMsg('启用 SSO 时必须填写 Client Secret。')
       return
     }
+    setMsg('')
     save.mutate()
   }
 
   async function testConnection() {
     const target = issuer.trim() || sso.data?.issuer || ''
     if (!target) { setMsg('请先填写 Issuer 地址。'); return }
+    setMsg('')
     setProbing(true)
     setProbe(null)
     try {
@@ -133,29 +153,44 @@ export function SsoSection() {
 
   const data = sso.data
   return (
-    <SectionCard
-      icon={<IconKey size={18} />}
-      tone="brand"
-      title="单点登录（SSO）"
-      titleId="sso-title"
-      titleAs="h3"
-      badge={data?.enabled ? <Badge color="green">已启用</Badge> : <Badge color="gray">未启用</Badge>}
-      actions={(
-        <Button variant="secondary" disabled={!data || save.isPending} onClick={openEditor}>
-          {editing ? '取消' : '配置'}
-        </Button>
-      )}
-    >
-      {editing ? (
-        <form onSubmit={submit} style={{ display: 'grid', gap: 12, maxWidth: 520 }}>
+    <>
+      <SectionCard
+        icon={<IconKey size={18} />}
+        tone="brand"
+        title="单点登录（SSO）"
+        titleId="sso-title"
+        titleAs="h3"
+        badge={data?.enabled ? <Badge color="green">已启用</Badge> : <Badge color="gray">未启用</Badge>}
+        actions={(
+          <Button variant="secondary" disabled={!data || save.isPending} onClick={openEditor}>
+            配置
+          </Button>
+        )}
+      >
+        <SsoSummary />
+      </SectionCard>
+
+      <DialogWrap
+        open={editing}
+        onOpenChange={(open) => { if (!open) closeEditor() }}
+        title="配置：单点登录（SSO）"
+        wide
+        footer={(
+          <>
+            <Button variant="ghost" disabled={save.isPending} onClick={closeEditor}>取消</Button>
+            <Button type="submit" form={formId} disabled={save.isPending}>{save.isPending ? '保存中…' : '保存'}</Button>
+          </>
+        )}
+      >
+        <form id={formId} onSubmit={submit} className={css.modalForm}>
           <Checkbox label="启用 SSO 登录" checked={enabled} disabled={save.isPending}
             onChange={(_, d) => setEnabled(!!d.checked)} />
           <FormLayout columns={2}>
             <FormField label="Issuer 地址" required info="如 https://casdoor.example.com，服务端会读取其 OIDC 发现文档。">
-              <Input value={issuer} onChange={(e) => setIssuer(e.target.value)} placeholder="https://casdoor.example.com" autoFocus />
+              <Input value={issuer} disabled={save.isPending} onChange={(e) => setIssuer(e.target.value)} placeholder="https://casdoor.example.com" autoFocus />
             </FormField>
             <FormField label="Client ID" required info="在 Casdoor 应用设置中创建并复制。">
-              <Input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="omnistore" />
+              <Input value={clientId} disabled={save.isPending} onChange={(e) => setClientId(e.target.value)} placeholder="omnistore" />
             </FormField>
           </FormLayout>
           <FormField
@@ -163,16 +198,16 @@ export function SsoSection() {
             required={enabled && !data?.has_secret}
             info={data?.has_secret ? '已保存密钥不回显；留空表示保留原值，输入新值即覆盖。' : '在 Casdoor 应用设置中复制。'}
           >
-            <Input type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)}
+            <Input type="password" value={clientSecret} disabled={save.isPending} onChange={(e) => setClientSecret(e.target.value)}
               placeholder={data?.has_secret ? '••••••••（已设置）' : ''} autoComplete="new-password" />
           </FormField>
           <FormLayout columns={2}>
             <FormField label="授权范围（Scopes）" info="空格分隔，至少包含 openid；默认 openid profile email。">
-              <Input value={scopes} onChange={(e) => setScopes(e.target.value)} placeholder="openid profile email" />
+              <Input value={scopes} disabled={save.isPending} onChange={(e) => setScopes(e.target.value)} placeholder="openid profile email" />
             </FormField>
             <FormField label="回调地址（登记到 IdP）" info="由实例对外地址自动派生，需原样填入 Casdoor 的 Redirect URLs。">
               <div className={css.redirectRow}>
-                <Input value={data?.redirect_uri ?? ''} readOnly />
+                <Input className={css.redirectInput} value={data?.redirect_uri ?? ''} readOnly />
                 <Button type="button" variant="secondary" icon={<IconCopy size={16} />} onClick={() => void copyRedirectURI()}>复制</Button>
               </div>
             </FormField>
@@ -192,8 +227,7 @@ export function SsoSection() {
             </p>
           </div>
           <div className={css.formActions}>
-            <Button type="submit" disabled={save.isPending}>{save.isPending ? '保存中…' : '保存'}</Button>
-            <Button type="button" variant="secondary" icon={<IconPlug size={16} />} disabled={probing} onClick={() => void testConnection()}>
+            <Button type="button" variant="secondary" icon={<IconPlug size={16} />} disabled={probing || save.isPending} onClick={() => void testConnection()}>
               {probing ? '测试中…' : '测试连接'}
             </Button>
           </div>
@@ -201,10 +235,8 @@ export function SsoSection() {
             : probe ? <Banner intent="error">连接失败：{probe.error ?? '未知错误'}</Banner> : null}
           {msg ? <Banner intent="error">{msg}</Banner> : null}
         </form>
-      ) : (
-        <SsoSummary />
-      )}
-    </SectionCard>
+      </DialogWrap>
+    </>
   )
 }
 

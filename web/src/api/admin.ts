@@ -246,6 +246,7 @@ export async function adminUpdateSource(
     description: string
     webdav_enabled: boolean
     s3_enabled: boolean
+    static_enabled: boolean
     quota_bytes: number
     exclude_patterns: string[]
   }>,
@@ -339,12 +340,44 @@ export interface StaticAssetPreflight {
   warnings: string[]
 }
 
+export interface StaticHttpEndpointSummary {
+  source_key: string
+  source_name: string
+  public_asset_id: string
+  base_url: string
+}
+
+export interface StaticHttpSettings {
+  public_origin: string
+  cache_mode: 'short' | 'no-cache' | 'long'
+  cors_mode: 'none' | 'public' | 'allowlist'
+  allowed_origins: string[]
+  sources: StaticHttpEndpointSummary[]
+}
+
+export async function adminGetStaticSettings(): Promise<StaticHttpSettings> {
+  return apiFetch<StaticHttpSettings>('/api/v1/admin/static-access/settings')
+}
+
+export async function adminUpdateStaticSettings(input: {
+  public_origin: string
+  cache_mode: string
+  cors_mode: string
+  allowed_origins: string[]
+}): Promise<StaticHttpSettings> {
+  return apiFetch<StaticHttpSettings>('/api/v1/admin/static-access/settings', {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  })
+}
+
 export async function adminGetStaticConfig(sourceKey: string): Promise<StaticAssetConfig> {
   return apiFetch<StaticAssetConfig>(`/api/v1/admin/sources/${encodeURIComponent(sourceKey)}/static-access/config`)
 }
 
 export async function adminConfigureStaticAssets(sourceKey: string, input: {
   publish_root: string
+  enabled?: boolean
   cache_mode?: string
   cors_mode?: string
   public_origin?: string

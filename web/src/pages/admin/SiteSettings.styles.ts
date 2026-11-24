@@ -20,19 +20,17 @@ export const useStyles = makeStyles({
   ...shorthands.gap(tokens.spacingVerticalXXL),
   'minWidth': '0px',
   },
-  featureGroup: {
+  dialogSection: {
   'display': 'flex',
   'flexDirection': 'column',
-  ...shorthands.gap('8px'),
-  'paddingTop': '16px',
+  ...shorthands.gap(tokens.spacingVerticalM),
+  'paddingTop': tokens.spacingVerticalL,
   'borderTopWidth': '1px', 'borderTopStyle': 'solid', 'borderTopColor': 'var(--colorNeutralStroke2)',
   },
-  featureRow: {
+  dialogFieldGroup: {
   'display': 'flex',
-  'alignItems': 'center',
-  'justifyContent': 'space-between',
-  ...shorthands.gap('16px'),
-  'flexWrap': 'wrap',
+  'flexDirection': 'column',
+  ...shorthands.gap(tokens.spacingVerticalXS),
   },
   hint: {
   ...shorthands.margin('0px'),

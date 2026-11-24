@@ -2,7 +2,16 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Tabs } from '../../../components/ui/Tabs'
 import { ApiRequestError } from '../../../api/client'
-import { adminCreateSource, adminGetSource, adminPreflightSource, adminReconcileSource, adminUpdateSource, type AdminSource, type SourcePreflight } from '../../../api/admin'
+import {
+  adminCreateSource,
+  adminGetSource,
+  adminGetStaticConfig,
+  adminPreflightSource,
+  adminReconcileSource,
+  adminUpdateSource,
+  type AdminSource,
+  type SourcePreflight,
+} from '../../../api/admin'
 import { Checkbox, Input, Textarea } from '@fluentui/react-components'
 import { Badge } from '../../../components/ui/Badge'
 import { Button } from '../../../components/ui/Button'
@@ -12,7 +21,6 @@ import { FormField } from '../../../components/shell/FormLayout'
 import { formatBytes } from '../../../utils/format'
 import { useStyles } from '../sections/sources.styles'
 import { quotaGiBInputValue } from '../shared'
-import { StaticAssetsSection } from './StaticAssetsSection'
 
 export function CreateSourceDialog({
   open,
@@ -223,8 +231,8 @@ export function EditSourceDialog({
   const [patterns, setPatterns] = useState<string | null>(null)
   const [webdavOn, setWebdavOn] = useState<boolean | null>(null)
   const [s3On, setS3On] = useState<boolean | null>(null)
+  const [staticOn, setStaticOn] = useState<boolean | null>(null)
   const [quotaGiB, setQuotaGiB] = useState<string | null>(null)
-  const [staticExpanded, setStaticExpanded] = useState(false)
   const [msg, setMsg] = useState('')
 
   // 打开弹窗时，把当前值同步到本地 state
@@ -233,14 +241,40 @@ export function EditSourceDialog({
       setPatterns(detail.data.exclude_patterns.join('\n'))
       setWebdavOn(detail.data.source.webdav_enabled)
       setS3On(detail.data.source.s3_enabled)
+      setStaticOn(detail.data.source.static_enabled)
       setQuotaGiB(quotaGiBInputValue(detail.data.source.quota_bytes))
     }
   }, [detail.isSuccess, detail.data])
 
-  const updateMut = useMutation({
-    mutationFn: (input: Parameters<typeof adminUpdateSource>[1]) => adminUpdateSource(sourceKey, input),
-    onSuccess: () => {
-      refresh()
+  const saveMut = useMutation({
+    mutationFn: async (params: {
+      webdavEnabled: boolean
+      s3Enabled: boolean
+      staticEnabled: boolean
+      staticChanged: boolean
+      quotaBytes: number
+      excludePatterns: string[]
+      wasStaticEnabled: boolean
+    }) => {
+      await adminUpdateSource(sourceKey, {
+        webdav_enabled: params.webdavEnabled,
+        s3_enabled: params.s3Enabled,
+        ...(params.staticChanged ? { static_enabled: params.staticEnabled } : {}),
+        quota_bytes: params.quotaBytes,
+        exclude_patterns: params.excludePatterns,
+      })
+      if (params.staticEnabled && !params.wasStaticEnabled) {
+        return adminGetStaticConfig(sourceKey)
+      }
+      return null
+    },
+    onSuccess: async (enabledConfig) => {
+      await refresh()
+      if (enabledConfig) {
+        const url = enabledConfig.base_url
+          || (enabledConfig.public_asset_id ? `${window.location.origin}/assets/${enabledConfig.public_asset_id}/` : '')
+        toastSuccess(url ? `已启用静态 HTTP：${url}` : '已启用静态 HTTP')
+      }
       onClose()
     },
     onError: (err) => setMsg(err instanceof ApiRequestError ? err.message : '保存失败'),
@@ -249,13 +283,16 @@ export function EditSourceDialog({
     mutationFn: () => adminReconcileSource(sourceKey),
     onSuccess: (result) => {
       toastSuccess(`台账已校准：扫描 ${result.scanned_files} 个文件，新增 ${result.added}，更新 ${result.updated}，移除 ${result.removed}`)
-      refresh()
+      void refresh()
     },
     onError: (err) => toastError(err instanceof ApiRequestError ? err.message : '校准失败'),
   })
   function refresh() {
-    queryClient.invalidateQueries({ queryKey: ['admin-source', sourceKey] })
-    queryClient.invalidateQueries({ queryKey: ['admin-sources'] })
+    return Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['admin-source', sourceKey] }),
+      queryClient.invalidateQueries({ queryKey: ['admin-sources'] }),
+      queryClient.invalidateQueries({ queryKey: ['static-assets-config', sourceKey] }),
+    ])
   }
 
   if (!detail.isSuccess) return null
@@ -270,6 +307,7 @@ export function EditSourceDialog({
     && Number.isSafeInteger(quotaBytes)
   const webdavEnabled = webdavOn ?? src.webdav_enabled
   const s3Enabled = s3On ?? src.s3_enabled
+  const staticEnabled = staticOn ?? src.static_enabled
   const excludePatterns = patternsValue
     .split('\n')
     .map((pattern) => pattern.trim())
@@ -277,8 +315,10 @@ export function EditSourceDialog({
   const originalPatterns = detail.data.exclude_patterns.map((pattern) => pattern.trim()).filter(Boolean)
   const patternsChanged = excludePatterns.length !== originalPatterns.length
     || excludePatterns.some((pattern, index) => pattern !== originalPatterns[index])
+  const staticChanged = staticEnabled !== src.static_enabled
   const isDirty = webdavEnabled !== src.webdav_enabled
     || s3Enabled !== src.s3_enabled
+    || staticChanged
     || quotaBytes !== src.quota_bytes
     || patternsChanged
   const formValid = quotaValid
@@ -289,11 +329,14 @@ export function EditSourceDialog({
       setMsg('请输入有效的非负配额')
       return
     }
-    updateMut.mutate({
-      webdav_enabled: webdavEnabled,
-      s3_enabled: s3Enabled,
-      quota_bytes: quotaBytes,
-      exclude_patterns: excludePatterns,
+    saveMut.mutate({
+      webdavEnabled,
+      s3Enabled,
+      staticEnabled,
+      staticChanged,
+      quotaBytes,
+      excludePatterns,
+      wasStaticEnabled: src.static_enabled,
     })
   }
 
@@ -308,10 +351,10 @@ export function EditSourceDialog({
         <>
           <Button variant="ghost" onClick={onClose}>取消</Button>
           <Button
-            disabled={!isDirty || !formValid || updateMut.isPending}
+            disabled={!isDirty || !formValid || saveMut.isPending}
             onClick={saveSettings}
           >
-            {updateMut.isPending ? '保存中…' : '保存设置'}
+            {saveMut.isPending ? '保存中…' : '保存设置'}
           </Button>
         </>
       }
@@ -339,21 +382,12 @@ export function EditSourceDialog({
                 onChange={(_, data) => { setS3On(!!data.checked); setMsg('') }} />
             </div>
             <div className={css.protocolRow}>
-              <div className={css.protocolCopy}>
+              <span className={css.protocolCopy}>
                 <span className={css.protocolName}>静态 HTTP</span>
-              </div>
-              <div className={css.protocolControl}>
-                <Button variant="secondary" aria-label={staticExpanded ? '收起静态 HTTP' : '配置静态 HTTP'}
-                  aria-expanded={staticExpanded} aria-controls={`static-access-${sourceKey}`}
-                  onClick={() => setStaticExpanded((expanded) => !expanded)}>
-                  {staticExpanded ? '收起' : '配置'}
-                </Button>
-              </div>
+              </span>
+              <Checkbox aria-label="启用静态 HTTP" checked={staticEnabled}
+                onChange={(_, data) => { setStaticOn(!!data.checked); setMsg('') }} />
             </div>
-          </div>
-          <p className={css.sourceConfigNote}>WebDAV、S3 与存储设置随底部按钮统一保存。静态 HTTP 在展开区域单独保存。</p>
-          <div id={`static-access-${sourceKey}`} hidden={!staticExpanded}>
-            <div className={css.staticAccessStack}><StaticAssetsSection sourceKey={sourceKey} /></div>
           </div>
           </div>
         </Tabs.Panel>
@@ -401,7 +435,7 @@ export function EditSourceDialog({
               ? '请先保存当前配置，再扫描并校准台账。'
               : `当前台账用量 ${formatBytes(detail.data.ledger_usage_bytes)}。校准会扫描真实目录，新发现文件标记为未归属。`}
           >
-            <Button variant="secondary" aria-label="扫描并校准台账" disabled={isDirty || reconcileMut.isPending || updateMut.isPending}
+            <Button variant="secondary" aria-label="扫描并校准台账" disabled={isDirty || reconcileMut.isPending || saveMut.isPending}
               onClick={() => reconcileMut.mutate()}>
               {reconcileMut.isPending ? '校准中…' : '扫描并校准台账'}
             </Button>

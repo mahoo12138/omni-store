@@ -4,7 +4,34 @@ import { useSharedStyles } from '../shared.styles'
 
 export const useSectionStyles = makeStyles({
   'protocolControl': {
+  'display': 'flex',
+  'alignItems': 'center',
+  ...shorthands.gap('8px'),
   'flexShrink': 0,
+  },
+  'staticBaseUrlBar': {
+  'display': 'flex',
+  'alignItems': 'center',
+  'justifyContent': 'space-between',
+  ...shorthands.gap('12px'),
+  ...shorthands.padding('10px', '12px'),
+  ...shorthands.borderWidth('1px'), ...shorthands.borderStyle('solid'), ...shorthands.borderColor('var(--colorNeutralStroke2)'),
+  ...shorthands.borderRadius('var(--borderRadiusMedium)'),
+  'backgroundColor': 'var(--colorNeutralBackground2)',
+  'minWidth': '0px',
+  },
+  'staticBaseUrlMeta': {
+  'display': 'flex',
+  'flexDirection': 'column',
+  ...shorthands.gap('2px'),
+  'minWidth': '0px',
+  },
+  'staticBaseUrlCode': {
+  'fontFamily': 'var(--fontFamilyMonospace)',
+  'fontSize': '12px',
+  'lineHeight': 1.5,
+  'color': 'var(--colorNeutralForeground1)',
+  'overflowWrap': 'anywhere',
   },
   'protocolCopy': {
   'display': 'flex',
@@ -36,21 +63,11 @@ export const useSectionStyles = makeStyles({
     'paddingBottom': '0px',
   },
   },
-  sourceActions: {
-    'gridArea': 'actions',
+  sourceActionRow: {
     'display': 'flex',
     'flexWrap': 'nowrap',
     'alignItems': 'center',
-    'justifySelf': 'end',
-    ...shorthands.gap(tokens.spacingHorizontalXXS),
-    'flexShrink': 0,
-    '@container storage-sources (max-width: 560px)': {
-      'justifySelf': 'stretch',
-      'justifyContent': 'flex-start',
-      // Fluent 按钮有 96px 最小宽度，窄卡片里三个按钮一行放不下；允许换行。
-      'flexWrap': 'wrap',
-      'rowGap': tokens.spacingVerticalXS,
-    },
+    ...shorthands.gap(tokens.spacingHorizontalXS),
   },
   // 间距全部由外层容器给：TabList 与 Tabs.Panel 不再被注入外观，
   // Fluent tab 保持默认观感，panel 的 hidden 也不会被 display 打败。
@@ -88,126 +105,27 @@ export const useSectionStyles = makeStyles({
   'overflow': 'hidden',
   'overflowWrap': 'anywhere',
   },
-  sourceCopy: {
-    'minWidth': '0px',
-    'display': 'grid',
-    // 单列栅格默认 max-content，长名称/长路径会把卡片撑出容器；必须显式允许收缩。
-    'gridTemplateColumns': 'minmax(0, 1fr)',
-    ...shorthands.gap(tokens.spacingVerticalXXS),
+  sourceCellMuted: {
+    'color': 'var(--colorNeutralForeground2)',
   },
-  'sourceHeading': {
-  'display': 'flex',
-  'flexWrap': 'wrap',
-  'alignItems': 'center',
-  ...shorthands.gap('8px'),
-  },
-  sourceIcon: {
-    'display': 'grid',
-    'placeItems': 'center',
-    'width': tokens.spacingHorizontalXXXL,
-    'height': tokens.spacingHorizontalXXXL,
-    'flexShrink': 0,
-    ...shorthands.borderRadius(tokens.borderRadiusMedium),
-    'backgroundColor': tokens.colorNeutralBackground1,
-    ...shorthands.border(tokens.strokeWidthThin, 'solid', tokens.colorNeutralStroke2),
-    'color': tokens.colorNeutralForeground2,
-  },
-  sourceIdentity: {
-    'gridArea': 'identity',
-    'display': 'flex',
-    'alignItems': 'center',
-    ...shorthands.gap(tokens.spacingHorizontalM),
-    'minWidth': '0px',
-  },
-  // 资源行：身份与操作同一行、元信息独占一条底带。
-  // 旧布局把身份铺满一行、第二行「元信息左 / 操作右」，中间必然留一大片空。
-  sourceItem: {
-    'display': 'grid',
-    'gridTemplateColumns': 'minmax(0, 1fr) auto',
-    'gridTemplateAreas': '"identity actions" "meta meta"',
-    'alignItems': 'center',
-    'columnGap': tokens.spacingHorizontalXL,
-    'rowGap': tokens.spacingVerticalL,
-    'minWidth': '0px',
-    ...shorthands.padding(tokens.spacingVerticalL, tokens.spacingHorizontalXL),
-    ...shorthands.borderWidth(tokens.strokeWidthThin), ...shorthands.borderStyle('solid'), ...shorthands.borderColor(tokens.colorNeutralStroke2),
-    'backgroundColor': tokens.colorNeutralBackground2,
-    ...shorthands.borderRadius(tokens.borderRadiusMedium),
-    'transitionProperty': 'border-color',
-    'transitionDuration': tokens.durationFaster,
-    '@container storage-sources (max-width: 560px)': {
-      'gridTemplateAreas': '"identity" "meta" "actions"',
-      'gridTemplateColumns': 'minmax(0, 1fr)',
-    },
-    '&:hover': {
-      ...shorthands.borderColor(tokens.colorNeutralStroke1),
-    },
-  },
-  'sourceList': {
-  'display': 'flex',
-  'flexDirection': 'column',
-  ...shorthands.gap('16px'),
-  'containerType': 'inline-size',
-  'containerName': 'storage-sources',
-  },
-  // 元信息底带：一条内缩的细线把它与身份区隔开，标签与值同行。
-  sourceMeta: {
-    'gridArea': 'meta',
-    'display': 'flex',
-    'flexWrap': 'wrap',
-    'alignItems': 'center',
-    'columnGap': tokens.spacingHorizontalXXL,
-    'rowGap': tokens.spacingVerticalS,
-    ...shorthands.padding(tokens.spacingVerticalM, '0px', '0px'),
-    'borderTopWidth': tokens.strokeWidthThin,
-    'borderTopStyle': 'solid',
-    'borderTopColor': tokens.colorNeutralStroke2,
-    'minWidth': '0px',
-  },
-  sourceMetaItem: {
-    'display': 'flex',
-    'alignItems': 'baseline',
-    ...shorthands.gap(tokens.spacingHorizontalS),
-    'minWidth': '0px',
-  },
-  sourceMetaLabel: {
-    'color': tokens.colorNeutralForeground3,
-    'fontSize': tokens.fontSizeBase200,
-  },
-  sourceMetaMuted: {
-  'fontSize': '13px',
-  'overflowWrap': 'anywhere',
-  'color': 'var(--colorNeutralForeground2)',
-  'fontWeight': 400,
-  },
-  sourceMetaValue: {
-    'color': tokens.colorNeutralForeground1,
-    'fontSize': tokens.fontSizeBase200,
-    'fontWeight': tokens.fontWeightMedium,
-    'overflowWrap': 'anywhere',
-  },
-  sourceName: {
-    ...shorthands.margin('0px'),
-    'minWidth': '0px',
-    'color': tokens.colorNeutralForeground1,
-    'fontSize': tokens.fontSizeBase300,
-    'fontWeight': tokens.fontWeightSemibold,
-    'lineHeight': tokens.lineHeightBase300,
-    // 单行省略：名称长度不该改变行高，完整值走 title。
+  sourceCellName: {
+    'fontWeight': 600,
     'overflow': 'hidden',
     'textOverflow': 'ellipsis',
     'whiteSpace': 'nowrap',
   },
-  sourcePath: {
+  sourceCellPath: {
     'display': 'block',
-    'color': tokens.colorNeutralForeground2,
+    'color': 'var(--colorNeutralForeground2)',
     'fontFamily': tokens.fontFamilyMonospace,
     'fontSize': tokens.fontSizeBase200,
     'lineHeight': tokens.lineHeightBase200,
-    // 长路径单行省略，避免把卡片撑成两行高；完整路径在 title 与配置弹窗里。
     'overflow': 'hidden',
     'textOverflow': 'ellipsis',
     'whiteSpace': 'nowrap',
+  },
+  sourceIdentityCell: {
+    'maxWidth': '380px',
   },
   'sourcePreview': {
   'display': 'flex',
@@ -294,17 +212,9 @@ export const useSectionStyles = makeStyles({
   'fontSize': '12px',
   'lineHeight': 1.55,
   },
-  sourceProtocolTag: {
-    ...shorthands.padding('1px', tokens.spacingHorizontalS),
-    ...shorthands.borderRadius(tokens.borderRadiusSmall),
-    'backgroundColor': tokens.colorNeutralBackground3,
-    'color': tokens.colorNeutralForeground2,
-    'fontSize': tokens.fontSizeBase200,
-    'lineHeight': tokens.lineHeightBase200,
-  },
   sourceProtocols: {
     'display': 'flex',
-    'flexWrap': 'wrap',
+    'flexWrap': 'nowrap',
     'alignItems': 'center',
     ...shorthands.gap(tokens.spacingHorizontalXS),
   },

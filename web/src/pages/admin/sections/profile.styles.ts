@@ -5,10 +5,29 @@ import { useSharedStyles } from '../shared.styles'
 export const useSectionStyles = makeStyles({
   'accountActions': {
   'display': 'flex',
-  'flexWrap': 'wrap',
-  ...shorthands.gap('8px'),
-  [media.xs]: {
-    'alignItems': 'stretch',
+  'alignItems': 'center',
+  'justifyContent': 'flex-end',
+  'flexShrink': 0,
+  },
+  'accountMenuTrigger': {
+  'display': 'inline-flex',
+  'alignItems': 'center',
+  'justifyContent': 'center',
+  'width': tokens.spacingHorizontalXXXL,
+  'height': tokens.spacingHorizontalXXXL,
+  ...shorthands.padding('0px'),
+  ...shorthands.borderWidth('0px'), ...shorthands.borderStyle('solid'),
+  ...shorthands.borderRadius(tokens.borderRadiusMedium),
+  'backgroundColor': 'transparent',
+  'color': tokens.colorNeutralForeground2,
+  'cursor': 'pointer',
+  '&:hover': {
+    'backgroundColor': tokens.colorNeutralBackground1Hover,
+    'color': tokens.colorNeutralForeground1,
+  },
+  '&:focus-visible': {
+    'outline': `${tokens.strokeWidthThick} solid ${tokens.colorStrokeFocus2}`,
+    'outlineOffset': '2px',
   },
   },
   'accountAvatar': {
@@ -59,9 +78,6 @@ export const useSectionStyles = makeStyles({
   'backgroundColor': 'var(--colorNeutralBackground1)',
   ...shorthands.borderWidth('1px'), ...shorthands.borderStyle('solid'), ...shorthands.borderColor('var(--colorNeutralStroke2)'),
   ...shorthands.borderRadius('var(--borderRadiusLarge)'),
-  [media.lg]: {
-    'gridTemplateColumns': 'minmax(0, 1fr)',
-  },
   },
   'bucketList': {
   'display': 'flex',
@@ -230,9 +246,10 @@ export const useSectionStyles = makeStyles({
   'credentialOverviewCopy': {
   'gridArea': 'copy',
   'display': 'flex',
-  'alignItems': 'baseline',
+  'alignItems': 'center',
   'flexWrap': 'wrap',
-  ...shorthands.gap('2px', '8px'),
+  'columnGap': '8px',
+  'rowGap': '2px',
   'minWidth': '0px',
   },
   'credentialOverviewMetaGroup': {
@@ -303,6 +320,10 @@ export const useSectionStyles = makeStyles({
   '&[data-kind="s3"]': {
     'backgroundColor': tokens.colorPaletteLightTealBackground2,
     'color': tokens.colorPaletteLightTealForeground2,
+  },
+  '&[data-kind="static-http"]': {
+    'backgroundColor': tokens.colorPaletteGreenBackground2,
+    'color': tokens.colorPaletteGreenForeground2,
   },
   },
   'credentialOverviewItem': {
@@ -445,10 +466,19 @@ export const useSectionStyles = makeStyles({
   },
   'tokenRevealRow': {
   'display': 'flex',
+  'alignItems': 'center',
   ...shorthands.gap('8px'),
   'minWidth': '0px',
   [media.xs]: {
     'flexDirection': 'column',
+    'alignItems': 'stretch',
+  },
+  },
+  'tokenRevealInput': {
+  'flex': '1 1 0%',
+  'minWidth': '0px',
+  '& input': {
+    'fontFamily': 'var(--fontFamilyMonospace)',
   },
   }
 })

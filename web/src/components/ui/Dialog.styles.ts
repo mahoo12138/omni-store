@@ -1,4 +1,4 @@
-import { makeStyles, tokens } from '@fluentui/react-components'
+import { makeStyles, shorthands, tokens } from '@fluentui/react-components'
 import { layout } from '../../styles/layout'
 
 // Fluent Dialog 原生观感;这里只有关闭按钮(absolute 于 surface 右上)与描述文本。
@@ -23,6 +23,7 @@ export const useStyles = makeStyles({
   // 堆在 DialogContent 里，没有这层间距时字段会互相贴住。
   content: {
     'display': 'grid',
+    'alignContent': 'start',
     'gap': tokens.spacingVerticalXL,
     'minWidth': '0px',
     // 短表单弹窗也要有舒展的内容区；矮屏用 30dvh 兜底，避免最小高度把弹窗顶出视口。
@@ -32,7 +33,15 @@ export const useStyles = makeStyles({
   },
   titleBlock: {
     gridRow: 1,
+    gridColumn: '1 / -1',
+    paddingRight: tokens.spacingHorizontalXXXL,
     minWidth: '0px',
+  },
+  surface: {
+    ...shorthands.borderColor(tokens.colorNeutralStroke2),
+    '&[data-fui-focus-visible]::after': {
+      ...shorthands.borderRadius(tokens.borderRadiusXLarge),
+    },
   },
   // Fluent DialogActions 默认左对齐；底部操作区靠右是本产品的约定。
   'actions': {

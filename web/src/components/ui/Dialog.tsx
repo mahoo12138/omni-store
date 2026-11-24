@@ -8,6 +8,7 @@ import {
   DialogSurface,
   DialogTitle,
   DialogTrigger,
+  tokens,
 } from '@fluentui/react-components'
 import { useStyles } from './Dialog.styles'
 import { layout } from '../../styles/layout'
@@ -105,11 +106,20 @@ export function DialogWrap({
     >
       <DialogDepthContext.Provider value={depth}>
         <DialogSurface
+          className={css.surface}
           backdrop={
             {
               'data-dialog-backdrop': '',
               'data-dialog-depth': depth,
-              style: { zIndex: DIALOG_BASE_Z_INDEX + layerOffset },
+              style: {
+                zIndex: DIALOG_BASE_Z_INDEX + layerOffset,
+                ...(depth > 1
+                  ? {
+                      backgroundColor: tokens.colorBackgroundOverlay,
+                      backdropFilter: 'blur(2px)',
+                    }
+                  : null),
+              },
             } as object
           }
           style={{

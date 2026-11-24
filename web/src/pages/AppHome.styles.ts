@@ -101,17 +101,20 @@ export const useStyles = makeStyles({
     'cursor': 'pointer',
     ...shorthands.border(tokens.strokeWidthThin, 'solid', tokens.colorNeutralStroke1),
     ...shorthands.borderRadius(tokens.borderRadiusMedium),
-    'transitionProperty': 'background-color, border-color, color',
+    'transitionProperty': 'transform, background-color, border-color, color, box-shadow',
     'transitionDuration': tokens.durationNormal,
     'transitionTimingFunction': tokens.curveDecelerateMax,
     'animation': 'omnistore-rise 420ms cubic-bezier(0.1,0.9,0.2,1) 180ms both',
     '&:hover': {
+      'translate': '0px -1px',
+      'boxShadow': tokens.shadow4,
       'backgroundColor': tokens.colorNeutralBackground2Hover,
       ...shorthands.borderColor(tokens.colorNeutralStroke1Hover),
       'color': tokens.colorNeutralForeground1,
     },
     '&:hover svg': {
       color: tokens.colorBrandForeground1,
+      transform: 'scale(1.08)',
     },
     '&:focus-visible': {
       outlineOffset: '2px',
@@ -283,36 +286,51 @@ export const useStyles = makeStyles({
   },
 
   // ---- 双栏工作区 ----
-  // 左栏是目录牌，右栏是台账。右栏撑满行高，空态因此与左栏等高，
-  // 不会在页面上留下半截空白。
-  // >4 个源时改走全宽密度目录：源卡片排成 2/3/4 列，最近文件落到下方。
-  // 用 data-dense 而不是第二个类 —— 两个类声明同一属性时生效顺序不确定。
+  // 左栏是固定高度可循环滚动的存储源目录，右栏是同高度固定内部滚动的最近文件台账。
   workspace: {
     'display': 'grid',
     'gridTemplateColumns': `minmax(${layout.appHomeSourceColumnMinWidth}, 5fr) minmax(0px, 7fr)`,
     'columnGap': layout.appHomeColumnGap,
     'rowGap': layout.appHomeSectionGap,
     'minWidth': '0px',
-    [media.xl]: {
-      'gridTemplateColumns': 'minmax(0px, 1fr)',
-    },
-    '&[data-dense]': {
+    'alignItems': 'start',
+    [media.lg]: {
       'gridTemplateColumns': 'minmax(0px, 1fr)',
     },
   },
 
-  // ---- 存储源：目录牌 ----
-  // 1–4 个源：左栏单列大牌；>4 个源：全宽 auto-fit，最小列宽 240px。
-  sourceList: {
-    'display': 'grid',
-    'gridTemplateColumns': `repeat(auto-fit, minmax(min(100%, ${layout.appHomeSourceCardMinWidth}), 1fr))`,
-    'alignContent': 'start',
+  // ---- 存储源：固定高度隐藏滚动条，鼠标滚轮平滑循环滚动 ----
+  sourceViewport: {
+    'position': 'relative',
+    'height': layout.appHomePanelHeight,
+    'minWidth': '0px',
+    'overflowY': 'auto',
+    'overflowX': 'hidden',
+    'overscrollBehaviorY': 'contain',
+    'scrollbarWidth': 'none',
+    'paddingBlock': '4px',
+    'paddingInline': '2px',
+    '&::-webkit-scrollbar': {
+      'display': 'none',
+    },
+    '&[data-loop]': {
+      'maskImage': 'linear-gradient(to bottom, transparent 0px, black 12px, black calc(100% - 16px), transparent 100%)',
+    },
+    [media.lg]: {
+      'height': layout.appHomePanelHeightCompact,
+    },
+  },
+  sourceViewportInner: {
+    'display': 'flex',
+    'flexDirection': 'column',
     'gap': tokens.spacingVerticalL,
     'minWidth': '0px',
-    '&[data-dense]': {
-      'gridTemplateColumns': `repeat(auto-fit, minmax(min(100%, ${layout.appHomeDenseCardMinWidth}), 1fr))`,
-      'gap': tokens.spacingVerticalM,
-    },
+  },
+  sourceList: {
+    'display': 'flex',
+    'flexDirection': 'column',
+    'gap': tokens.spacingVerticalL,
+    'minWidth': '0px',
   },
   sourcePlate: {
     'display': 'flex',
@@ -321,7 +339,7 @@ export const useStyles = makeStyles({
     'gap': tokens.spacingVerticalS,
     'width': '100%',
     'minHeight': layout.appHomeSourcePlateMinHeight,
-    'padding': tokens.spacingVerticalXXL,
+    'padding': tokens.spacingVerticalXL,
     'textAlign': 'start',
     'cursor': 'pointer',
     'color': tokens.colorNeutralForeground1,
@@ -329,65 +347,39 @@ export const useStyles = makeStyles({
     'backgroundColor': tokens.colorNeutralBackground2,
     ...shorthands.border(tokens.strokeWidthThin, 'solid', tokens.colorNeutralStroke2),
     ...shorthands.borderRadius(tokens.borderRadiusLarge),
-    'transitionProperty': 'background-color, border-color',
+    'transitionProperty': 'translate, background-color, border-color, box-shadow',
     'transitionDuration': tokens.durationNormal,
     'transitionTimingFunction': tokens.curveDecelerateMax,
     'animation': 'omnistore-rise 460ms cubic-bezier(0.16,1,0.3,1) 140ms both',
+    '&[data-clone]': {
+      'animation': 'none',
+    },
     '&:hover': {
+      'translate': '0px -2px',
+      'boxShadow': tokens.shadow4,
       'backgroundColor': tokens.colorNeutralBackground2Hover,
       ...shorthands.borderColor(tokens.colorNeutralStroke1Hover),
+    },
+    '&:active': {
+      'translate': '0px 0px',
     },
     // 子元素的呼应全部走 data-*：Griffel 类名是哈希，跨元素选不中。
     '&:hover [data-source-index]': {
       color: tokens.colorBrandForeground1,
+      transform: 'scale(1.05)',
     },
     '&:hover [data-source-glyph]': {
-      transform: 'translateY(-2px)',
+      transform: 'translateY(-2px) scale(1.06) rotate(-3deg)',
     },
     '&:hover [data-open-action]': {
-      insetInlineStart: '3px',
+      transform: 'translateX(4px)',
     },
     '&:focus-visible': {
       'backgroundColor': tokens.colorNeutralBackground2Hover,
       'outlineOffset': '2px',
     },
-    // 密度档：同一张目录牌压到 140px，铭牌、索引、字阶整体收一档；
-    // 4 列时仍保留编号语言，只是不再占半屏。
-    '&[data-dense]': {
-      'minHeight': layout.appHomeDensePlateMinHeight,
-      'padding': tokens.spacingVerticalL,
-      'gap': tokens.spacingVerticalXS,
-      '& [data-source-glyph]': {
-        'width': layout.appHomeDenseGlyphSize,
-        'height': layout.appHomeDenseGlyphSize,
-      },
-      '& [data-source-index]': {
-        'fontSize': tokens.fontSizeBase500,
-        'lineHeight': 1,
-      },
-      '& [data-source-name]': {
-        'marginTop': '0px',
-        'fontSize': tokens.fontSizeBase400,
-        'lineHeight': tokens.lineHeightBase400,
-      },
-      '& [data-source-desc]': {
-        'display': 'block',
-        'fontSize': tokens.fontSizeBase200,
-        'lineHeight': tokens.lineHeightBase200,
-        ...shorthands.overflow('hidden'),
-        'whiteSpace': 'nowrap',
-        'textOverflow': 'ellipsis',
-      },
-      '& [data-source-foot]': {
-        'paddingTop': tokens.spacingVerticalM,
-        'columnGap': tokens.spacingHorizontalS,
-      },
-      '& [data-open-action]': {
-        'fontSize': tokens.fontSizeBase200,
-      },
-    },
     [media.sm]: {
-      'padding': tokens.spacingVerticalXL,
+      'padding': tokens.spacingVerticalL,
     },
   },
   sourceTop: {
@@ -419,7 +411,7 @@ export const useStyles = makeStyles({
     'fontWeight': tokens.fontWeightSemibold,
     'letterSpacing': '0.02em',
     'fontVariantNumeric': 'tabular-nums',
-    'transitionProperty': 'color',
+    'transitionProperty': 'color, transform',
     'transitionDuration': tokens.durationNormal,
     'transitionTimingFunction': tokens.curveDecelerateMax,
   },
@@ -463,13 +455,13 @@ export const useStyles = makeStyles({
     'display': 'inline-flex',
     'alignItems': 'center',
     'gap': tokens.spacingHorizontalXS,
-    'position': 'relative',
-    'insetInlineStart': '0px',
     'color': tokens.colorBrandForeground1,
     'fontSize': tokens.fontSizeBase300,
     'fontWeight': tokens.fontWeightSemibold,
     'whiteSpace': 'nowrap',
-    'transition': 'inset-inline-start 180ms cubic-bezier(0.16,1,0.3,1)',
+    'transitionProperty': 'transform',
+    'transitionDuration': tokens.durationNormal,
+    'transitionTimingFunction': 'cubic-bezier(0.16,1,0.3,1)',
   },
 
   // 骨架与目录牌同形：加载完版面不跳。
@@ -517,14 +509,15 @@ export const useStyles = makeStyles({
   recentList: {
     'display': 'flex',
     'flexDirection': 'column',
-    'maxHeight': layout.appHomeRecentListMaxHeight,
+    'height': layout.appHomePanelHeight,
     'minWidth': '0px',
     'overflowY': 'auto',
+    'overscrollBehaviorY': 'contain',
     'scrollbarGutter': 'stable',
-    // 窄屏交给页面本身滚动：手机上的内层滚动条比桌面更难用。
-    [media.sm]: {
-      'maxHeight': 'none',
-      'overflowY': 'visible',
+    'scrollbarWidth': 'thin',
+    'scrollbarColor': `${tokens.colorNeutralStroke1} transparent`,
+    [media.lg]: {
+      'height': layout.appHomePanelHeightCompact,
     },
   },
   recentRow: {
@@ -545,6 +538,9 @@ export const useStyles = makeStyles({
     'animation': 'omnistore-rise 420ms cubic-bezier(0.16,1,0.3,1) 160ms both',
     '&:hover': {
       backgroundColor: tokens.colorNeutralBackground1Hover,
+    },
+    '&:hover [data-recent-icon]': {
+      transform: 'scale(1.06)',
     },
     // 行分隔线从图标之后起笔：读起来是台账的横行，不是表格边框。
     '&::after': {
@@ -579,6 +575,9 @@ export const useStyles = makeStyles({
     'width': `${layout.appHomeRecentIconPx}px`,
     'height': `${layout.appHomeRecentIconPx}px`,
     'flexShrink': 0,
+    'transitionProperty': 'transform',
+    'transitionDuration': tokens.durationNormal,
+    'transitionTimingFunction': tokens.curveDecelerateMax,
   },
   recentFileName: {
     'gridArea': 'name',
@@ -682,10 +681,11 @@ export const useStyles = makeStyles({
     'color': tokens.colorNeutralForeground3,
     'textDecoration': 'none',
     ...shorthands.borderRadius(tokens.borderRadiusSmall),
-    'transitionProperty': 'background-color, color',
+    'transitionProperty': 'transform, background-color, color',
     'transitionDuration': tokens.durationNormal,
     'transitionTimingFunction': tokens.curveDecelerateMax,
     '&:hover': {
+      'transform': 'translateY(1px)',
       'color': tokens.colorBrandForeground1,
       'backgroundColor': tokens.colorBrandBackground2,
     },
@@ -752,14 +752,15 @@ export const useStyles = makeStyles({
     'flexDirection': 'column',
     'alignItems': 'center',
     'justifyContent': 'center',
-    'height': '100%',
-    'minHeight': layout.appHomeRecentEmptyMinHeight,
-    'maxHeight': layout.appHomeRecentListMaxHeight,
+    'height': layout.appHomePanelHeight,
     'paddingBlock': tokens.spacingVerticalXXXL,
     'paddingInline': tokens.spacingHorizontalL,
     'textAlign': 'center',
     'backgroundImage': `radial-gradient(68% 58% at 50% 44%, ${tokens.colorBrandBackground2} 0%, transparent 72%)`,
     'animation': 'omnistore-rise 480ms cubic-bezier(0.16,1,0.3,1) 120ms both',
+    [media.lg]: {
+      'height': layout.appHomePanelHeightCompact,
+    },
   },
   emptyArt: {
     'display': 'block',

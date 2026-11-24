@@ -1,11 +1,11 @@
-import { useState, type FormEvent, type ReactElement } from 'react'
+import { useEffect, useId, useState, type FormEvent, type ReactElement } from 'react'
 import { Tabs } from '../../components/ui/Tabs'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   adminExportSystemConfig, adminGetAnonymousSettings, adminGetBranding,
   adminGetImageBedRetention, adminListCapabilities, adminListSources,
   adminSetAnonymousSettings, adminSetBranding, adminSetImageBedRetention, adminUpdateCapability,
-  type AdminSource, type CapabilityBinding, type ImageBedRetention, type SiteCapability,
+  type AdminSource, type CapabilityBinding, type SiteCapability,
 } from '../../api/admin'
 import { apiFetch, ApiRequestError } from '../../api/client'
 import { fetchSystemStatus } from '../../api/system'
@@ -64,17 +64,27 @@ export function SiteSettingsSection({ tab, onTabChange }: { tab: SiteTab; onTabC
   )
 }
 
+const formatRetentionDays = (value: number) => value === 0 ? '不自动过期' : `${value} 天`
+
 function SiteServicesSection() {
   const css = useStyles()
   const site = useSiteStyles()
   const queryClient = useQueryClient()
   const capabilities = useQuery({ queryKey: ['admin-capabilities'], queryFn: adminListCapabilities, retry: false })
   const sources = useQuery({ queryKey: ['admin-sources'], queryFn: adminListSources, retry: false })
+  const anonSettings = useQuery({ queryKey: ['admin-anon-settings'], queryFn: adminGetAnonymousSettings, retry: false })
+  const retention = useQuery({ queryKey: ['admin-image-bed-retention'], queryFn: adminGetImageBedRetention, retry: false })
+  const anonStatus = useQuery({ queryKey: ['anon-status'], queryFn: fetchAnonymousStatus, retry: false })
   const [editing, setEditing] = useState<SiteCapability | null>(null)
   const refresh = async () => {
-    await Promise.all(['admin-capabilities', 'admin-anon-settings', 'anon-status', 'system-status', 'admin-overview'].map(
-      (key) => queryClient.invalidateQueries({ queryKey: [key] }),
-    ))
+    await Promise.all([
+      'admin-capabilities',
+      'admin-anon-settings',
+      'admin-image-bed-retention',
+      'anon-status',
+      'system-status',
+      'admin-overview',
+    ].map((key) => queryClient.invalidateQueries({ queryKey: [key] })))
   }
   if (!capabilities.data || !sources.data) {
     const error = capabilities.error || sources.error
@@ -114,8 +124,29 @@ function SiteServicesSection() {
               <dl className={site.facts}>
                 {/* 只展示源名称：真实目录属于存储源维护页的信息，服务配置页不重复暴露。 */}
                 <div><dt>存储源</dt><dd>{binding?.source_name || '未绑定'}</dd></div>
+                {service.key === 'image_bed' ? (
+                  <>
+                    <div>
+                      <dt>匿名上传</dt>
+                      <dd>
+                        {anonSettings.data
+                          ? anonSettings.data.enabled
+                            ? `已开启${anonStatus.data ? `（单张最大 ${anonStatus.data.max_file_size_mb} MB）` : ''}`
+                            : '已关闭'
+                          : anonSettings.isError ? '读取失败' : '加载中…'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>图片保留</dt>
+                      <dd>
+                        {retention.data
+                          ? `登录用户 ${formatRetentionDays(retention.data.user_retention_days)} · 匿名上传 ${formatRetentionDays(retention.data.anonymous_retention_days)}`
+                          : retention.isError ? '读取失败' : '加载中…'}
+                      </dd>
+                    </div>
+                  </>
+                ) : null}
               </dl>
-              {service.key === 'image_bed' && binding ? <ImageBedOptions usable={binding.enabled && !!source && !source.is_disabled} /> : null}
             </div>
           </SectionCard>
         )
@@ -138,14 +169,65 @@ function SiteServiceDialog({ binding, service, sources, onClose, onSaved }: {
   onClose: () => void
   onSaved: () => Promise<void>
 }) {
+  const site = useSiteStyles()
   const queryClient = useQueryClient()
+  const isImageBed = binding.capability === 'image_bed'
+  const anonSettings = useQuery({ queryKey: ['admin-anon-settings'], queryFn: adminGetAnonymousSettings, enabled: isImageBed, retry: false })
+  const retention = useQuery({ queryKey: ['admin-image-bed-retention'], queryFn: adminGetImageBedRetention, enabled: isImageBed, retry: false })
+  const anonStatus = useQuery({ queryKey: ['anon-status'], queryFn: fetchAnonymousStatus, enabled: isImageBed, retry: false })
+
   const [enabled, setEnabled] = useState(binding.enabled)
   const [sourceKey, setSourceKey] = useState(binding.source_key ?? '')
   const [revision, setRevision] = useState(binding.revision)
+  const [anonEnabled, setAnonEnabled] = useState(anonSettings.data?.enabled ?? false)
+  const [anonInitialized, setAnonInitialized] = useState(!!anonSettings.data)
+  const [userDays, setUserDays] = useState(retention.data ? String(retention.data.user_retention_days) : '')
+  const [anonymousDays, setAnonymousDays] = useState(retention.data ? String(retention.data.anonymous_retention_days) : '')
+  const [retentionInitialized, setRetentionInitialized] = useState(!!retention.data)
   const [error, setError] = useState('')
   const [conflict, setConflict] = useState('')
+
+  useEffect(() => {
+    if (isImageBed && !anonInitialized && anonSettings.data) {
+      setAnonEnabled(anonSettings.data.enabled)
+      setAnonInitialized(true)
+    }
+  }, [isImageBed, anonInitialized, anonSettings.data])
+
+  useEffect(() => {
+    if (isImageBed && !retentionInitialized && retention.data) {
+      setUserDays(String(retention.data.user_retention_days))
+      setAnonymousDays(String(retention.data.anonymous_retention_days))
+      setRetentionInitialized(true)
+    }
+  }, [isImageBed, retentionInitialized, retention.data])
+
+  const selectedSource = sources.find((item) => item.key === sourceKey)
+  const serviceUsable = enabled && !!selectedSource && !selectedSource.is_disabled
+
   const mutation = useMutation({
-    mutationFn: () => adminUpdateCapability(binding.capability, { enabled, storage_source_key: sourceKey, expected_revision: revision }),
+    mutationFn: async () => {
+      const updated = await adminUpdateCapability(binding.capability, {
+        enabled,
+        storage_source_key: sourceKey,
+        expected_revision: revision,
+      })
+      setRevision(updated.revision)
+      if (isImageBed) {
+        if (anonSettings.data && anonEnabled !== anonSettings.data.enabled) {
+          await adminSetAnonymousSettings({ enabled: anonEnabled })
+        }
+        if (
+          retention.data
+          && (Number(userDays) !== retention.data.user_retention_days || Number(anonymousDays) !== retention.data.anonymous_retention_days)
+        ) {
+          await adminSetImageBedRetention({
+            user_retention_days: Number(userDays),
+            anonymous_retention_days: Number(anonymousDays),
+          })
+        }
+      }
+    },
     onSuccess: onSaved,
     onError: async (e) => {
       setError(e instanceof Error ? e.message : '保存服务设置失败')
@@ -161,15 +243,27 @@ function SiteServiceDialog({ binding, service, sources, onClose, onSaved }: {
         } catch {
           setConflict('配置已被其他管理员修改，最新状态读取失败。请关闭后重新打开配置。')
         }
+      } else {
+        await Promise.all(['admin-capabilities', 'admin-anon-settings', 'admin-image-bed-retention'].map(
+          (key) => queryClient.invalidateQueries({ queryKey: [key] }),
+        ))
       }
     },
   })
+
   function submit() {
-    const source = sources.find((item) => item.key === sourceKey)
-    if (enabled && !source) { setError('启用服务前，请选择绑定存储源。'); return }
-    if (enabled && source?.is_disabled) { setError('该存储源已禁用，请启用存储源或选择其他源。'); return }
+    if (enabled && !selectedSource) { setError('启用服务前，请选择绑定存储源。'); return }
+    if (enabled && selectedSource?.is_disabled) { setError('该存储源已禁用，请启用存储源或选择其他源。'); return }
+    if (
+      isImageBed
+      && retention.data
+      && [userDays, anonymousDays].some((value) => value.trim() === '' || !Number.isSafeInteger(Number(value)) || Number(value) < 0)
+    ) {
+      setError('保留天数必须是非负整数。'); return
+    }
     setError(''); setConflict(''); mutation.mutate()
   }
+
   return (
     <DialogWrap open onOpenChange={(open) => { if (!open && !mutation.isPending) onClose() }} title={`配置：${service.name}`}
       footer={<><Button variant="ghost" disabled={mutation.isPending} onClick={onClose}>取消</Button><Button disabled={mutation.isPending || (enabled && !sourceKey)} onClick={submit}>{mutation.isPending ? '保存中…' : '保存服务设置'}</Button></>}
@@ -183,92 +277,51 @@ function SiteServiceDialog({ binding, service, sources, onClose, onSaved }: {
         <Select ariaLabel="绑定存储源" value={sourceKey} disabled={mutation.isPending} onValueChange={setSourceKey}
           options={[{ value: '', label: '未绑定' }, ...sources.map((source) => ({ value: source.key, label: `${source.name}${source.is_disabled ? '（已禁用）' : ''}`, disabled: source.is_disabled }))]} />
       </FormField>
+      {isImageBed ? (
+        <div className={site.dialogSection}>
+          <div className={site.dialogFieldGroup}>
+            {anonSettings.data ? (
+              <>
+                <Checkbox
+                  label="允许匿名上传"
+                  checked={anonEnabled}
+                  disabled={mutation.isPending || anonSettings.isFetching || (!serviceUsable && !anonEnabled)}
+                  onChange={(_, data) => setAnonEnabled(!!data.checked)}
+                />
+                <p className={site.hint}>
+                  {!serviceUsable
+                    ? '图床服务或绑定源当前不可用，匿名入口暂不可用。'
+                    : anonEnabled
+                      ? `任何人都可通过 /upload 上传图片${anonStatus.data ? `，单张最大 ${anonStatus.data.max_file_size_mb} MB` : ''}。`
+                      : '匿名上传已关闭。'}
+                </p>
+              </>
+            ) : anonSettings.isError ? (
+              <Banner intent="error" action={<Button variant="ghost" onClick={() => void anonSettings.refetch()}>重试</Button>}>
+                匿名设置读取失败：{anonSettings.error.message}
+              </Banner>
+            ) : <span className={site.hint}>正在加载匿名上传设置…</span>}
+          </div>
+          {retention.data ? (
+            <FormLayout columns={2}>
+              <FormField
+                label="登录用户图片保留天数"
+                info="0 表示不自动过期；到期后图片直链与缩略图停止提供，历史记录保留供清理。"
+              >
+                <Input type="number" min="0" step="1" value={userDays} disabled={mutation.isPending} onChange={(event) => setUserDays(event.target.value)} />
+              </FormField>
+              <FormField label="匿名图片保留天数" info="0 表示不自动过期。">
+                <Input type="number" min="0" step="1" value={anonymousDays} disabled={mutation.isPending} onChange={(event) => setAnonymousDays(event.target.value)} />
+              </FormField>
+            </FormLayout>
+          ) : retention.isError ? (
+            <Banner intent="error" action={<Button variant="ghost" onClick={() => void retention.refetch()}>重试</Button>}>
+              保留策略读取失败：{retention.error.message}
+            </Banner>
+          ) : <span className={site.hint}>正在加载图片保留策略…</span>}
+        </div>
+      ) : null}
       {conflict ? <Banner intent="warning">{conflict}</Banner> : error ? <Banner intent="error">{error}</Banner> : null}
-    </DialogWrap>
-  )
-}
-
-function ImageBedOptions({ usable }: { usable: boolean }) {
-  const site = useSiteStyles()
-  const queryClient = useQueryClient()
-  const settings = useQuery({ queryKey: ['admin-anon-settings'], queryFn: adminGetAnonymousSettings, retry: false })
-  const retention = useQuery({ queryKey: ['admin-image-bed-retention'], queryFn: adminGetImageBedRetention, retry: false })
-  const status = useQuery({ queryKey: ['anon-status'], queryFn: fetchAnonymousStatus, retry: false })
-  const [retentionOpen, setRetentionOpen] = useState(false)
-  const [error, setError] = useState('')
-  const mutation = useMutation({
-    mutationFn: (enabled: boolean) => adminSetAnonymousSettings({ enabled }),
-    onMutate: (enabled) => {
-      setError('')
-      const previous = settings.data
-      if (previous) queryClient.setQueryData(['admin-anon-settings'], { ...previous, enabled })
-      return previous
-    },
-    onError: (e, _, previous) => {
-      if (previous) queryClient.setQueryData(['admin-anon-settings'], previous)
-      setError(e instanceof Error ? e.message : '匿名上传设置保存失败')
-    },
-    onSettled: async () => {
-      await Promise.all(['admin-anon-settings', 'anon-status', 'system-status', 'admin-overview'].map((key) => queryClient.invalidateQueries({ queryKey: [key] })))
-    },
-  })
-  const days = (value: number) => value === 0 ? '不自动过期' : `${value} 天`
-  return (
-    <div className={site.featureGroup}>
-      {settings.data ? (
-        <>
-          <Checkbox label="允许匿名上传" checked={settings.data.enabled}
-            disabled={mutation.isPending || settings.isFetching || (!usable && !settings.data.enabled)}
-            onChange={(_, data) => mutation.mutate(!!data.checked)} />
-          <p className={site.hint}>{!usable ? '图床服务或绑定源当前不可用，匿名入口暂不可用。'
-            : settings.data.enabled ? `任何人都可通过 /upload 上传图片${status.data ? `，单张最大 ${status.data.max_file_size_mb} MB` : ''}。`
-              : '匿名上传已关闭。'}{mutation.isPending ? ' 正在保存…' : ''}</p>
-        </>
-      ) : settings.isError ? <Banner intent="error" action={<Button variant="ghost" onClick={() => void settings.refetch()}>重试</Button>}>匿名设置读取失败：{settings.error.message}</Banner>
-        : <span className={site.hint}>正在加载匿名上传设置…</span>}
-      {error ? <Banner intent="error">{error}</Banner> : null}
-      <div className={site.featureRow}>
-        <p className={site.hint}>{retention.data ? `图片保留：登录用户${days(retention.data.user_retention_days)} · 匿名上传${days(retention.data.anonymous_retention_days)}` : '图片保留策略尚未加载。'}</p>
-        <Button variant="secondary" disabled={!retention.data || retention.isFetching} onClick={() => setRetentionOpen(true)}>保留策略</Button>
-      </div>
-      {retention.isError ? <Banner intent="error" action={<Button variant="ghost" onClick={() => void retention.refetch()}>重试</Button>}>保留策略读取失败：{retention.error.message}</Banner> : null}
-      {retentionOpen && retention.data ? <ImageRetentionDialog retention={retention.data} onClose={() => setRetentionOpen(false)} /> : null}
-    </div>
-  )
-}
-
-function ImageRetentionDialog({ retention, onClose }: { retention: ImageBedRetention; onClose: () => void }) {
-  const queryClient = useQueryClient()
-  const [userDays, setUserDays] = useState(String(retention.user_retention_days))
-  const [anonymousDays, setAnonymousDays] = useState(String(retention.anonymous_retention_days))
-  const [error, setError] = useState('')
-  const mutation = useMutation({
-    mutationFn: () => adminSetImageBedRetention({ user_retention_days: Number(userDays), anonymous_retention_days: Number(anonymousDays) }),
-    onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ['admin-image-bed-retention'] }); onClose() },
-    onError: (e) => setError(e instanceof Error ? e.message : '保留策略保存失败'),
-  })
-  function submit() {
-    if ([userDays, anonymousDays].some((value) => value.trim() === '' || !Number.isSafeInteger(Number(value)) || Number(value) < 0)) {
-      setError('保留天数必须是非负整数。'); return
-    }
-    setError(''); mutation.mutate()
-  }
-  return (
-    <DialogWrap open onOpenChange={(open) => { if (!open && !mutation.isPending) onClose() }} title="图片保留策略"
-      footer={<><Button variant="ghost" disabled={mutation.isPending} onClick={onClose}>取消</Button><Button disabled={mutation.isPending} onClick={submit}>{mutation.isPending ? '保存中…' : '保存保留策略'}</Button></>}
-    >
-      <FormLayout columns={2}>
-        <FormField
-          label="登录用户图片保留天数"
-          info="0 表示不自动过期；到期后图片直链与缩略图停止提供，历史记录保留供清理。"
-        >
-          <Input type="number" min="0" step="1" value={userDays} disabled={mutation.isPending} onChange={(event) => setUserDays(event.target.value)} />
-        </FormField>
-        <FormField label="匿名图片保留天数" info="0 表示不自动过期。">
-          <Input type="number" min="0" step="1" value={anonymousDays} disabled={mutation.isPending} onChange={(event) => setAnonymousDays(event.target.value)} />
-        </FormField>
-      </FormLayout>
-      {error ? <Banner intent="error">{error}</Banner> : null}
     </DialogWrap>
   )
 }
@@ -336,14 +389,18 @@ function BrandingSection() {
   const [name, setName] = useState('')
   const [editing, setEditing] = useState(false)
   const [msg, setMsg] = useState('')
+  const formId = useId()
 
   const save = useMutation({
     mutationFn: () => adminSetBranding(name),
     onSuccess: async () => {
       setEditing(false)
       setMsg('')
-      await queryClient.invalidateQueries({ queryKey: ['admin-branding'] })
-      await queryClient.invalidateQueries({ queryKey: ['system-status'] })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['admin-branding'] }),
+        queryClient.invalidateQueries({ queryKey: ['system-status'] }),
+      ])
+      toastSuccess('实例名称已更新。')
     },
     onError: (error) => {
       setMsg(error instanceof ApiRequestError ? error.message : '保存失败，请重试。')
@@ -356,46 +413,78 @@ function BrandingSection() {
       setMsg('实例名称不能超过 64 个字符。')
       return
     }
+    setMsg('')
     save.mutate()
   }
 
   const currentName = branding.data?.instance_name ?? 'OmniStore'
 
   return (
-    <SectionCard
-      icon={<IconTag size={18} />}
-      tone="brand"
-      title="品牌信息"
-      titleId="branding-title"
-      titleAs="h3"
-      actions={(
-        <Button
-          variant="secondary" disabled={!branding.data || save.isPending}
-          onClick={() => {
-            setName(currentName)
-            setEditing((open) => !open)
-            setMsg('')
-          }}
-        >
-          {editing ? '取消' : '修改名称'}
-        </Button>
-      )}
-    >
-      {editing ? (
-        <form onSubmit={submit} style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
-          <FormField label="实例名称" required error={msg} info="1-64 个字符；清空保存可恢复默认名称 OmniStore。">
-            <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="OmniStore" autoFocus />
-          </FormField>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Button type="submit" disabled={save.isPending}>{save.isPending ? '保存中…' : '保存'}</Button>
+    <>
+      <SectionCard
+        icon={<IconTag size={18} />}
+        tone="brand"
+        title="品牌信息"
+        titleId="branding-title"
+        titleAs="h3"
+        actions={(
+          <Button
+            variant="secondary"
+            disabled={!branding.data || save.isPending}
+            onClick={() => {
+              setName(currentName)
+              setMsg('')
+              setEditing(true)
+            }}
+          >
+            修改名称
+          </Button>
+        )}
+      >
+        {branding.isError ? (
+          <Banner intent="error" action={<Button variant="ghost" onClick={() => void branding.refetch()}>重试</Button>}>
+            品牌信息读取失败：{branding.error.message}
+          </Banner>
+        ) : (
+          <div className={css.kvRow}>
+            <span className={css.kvLabel}>实例名称</span>
+            <span className={css.kvValue}>{branding.isPending ? '加载中…' : currentName}</span>
           </div>
+        )}
+      </SectionCard>
+
+      <DialogWrap
+        open={editing}
+        onOpenChange={(open) => {
+          if (!open && !save.isPending) {
+            setEditing(false)
+            setMsg('')
+          }
+        }}
+        title="修改名称"
+        footer={(
+          <>
+            <Button variant="ghost" disabled={save.isPending} onClick={() => { setEditing(false); setMsg('') }}>
+              取消
+            </Button>
+            <Button type="submit" form={formId} disabled={save.isPending}>
+              {save.isPending ? '保存中…' : '保存'}
+            </Button>
+          </>
+        )}
+      >
+        <form id={formId} onSubmit={submit}>
+          <FormField label="实例名称" required error={msg} info="1-64 个字符；清空保存可恢复默认名称 OmniStore。">
+            <Input
+              value={name}
+              disabled={save.isPending}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="OmniStore"
+              autoFocus
+            />
+          </FormField>
         </form>
-      ) : (
-        branding.isError ? <Banner intent="error" action={<Button variant="ghost" onClick={() => void branding.refetch()}>重试</Button>}>品牌信息读取失败：{branding.error.message}</Banner> : <div className={css.kvRow}>
-          <span className={css.kvLabel}>实例名称</span>
-          <span className={css.kvValue}>{branding.isPending ? '加载中…' : currentName}</span>
-        </div>
-      )}
-    </SectionCard>
+      </DialogWrap>
+    </>
   )
 }

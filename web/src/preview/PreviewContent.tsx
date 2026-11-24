@@ -1,16 +1,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import Viewer from 'react-viewer'
-// react-viewer 3.x 的样式已内联进产物，无需单独引入 CSS。
 import { IconDownload, IconFile, IconRefresh } from '../components/ui/Icon'
 import { formatBytes } from '../utils/format'
 import { extOf, PREVIEW_CAPS, resolvePreview, type PreviewKind } from './resolver'
 import { fetchBlob, fetchCappedText } from './content'
 import { CodeBlock } from './CodeBlock'
+import { ImageLightbox } from './ImageLightbox'
 import { MarkdownView } from './MarkdownView'
 import * as css from './Preview.classes'
-
-// react-viewer 的层级取 toast 档位，保证高于预览弹层。
-const VIEWER_Z_INDEX = 50
 
 // 预览条目：文件管理器与分享页共用的最小文件描述。
 export interface PreviewItem {
@@ -119,14 +115,10 @@ function ImagePreview({ item }: { item: PreviewItem }) {
         <LoadingState label="正在加载图片…" />
       )}
       {src && zoomed ? (
-        <Viewer
-          visible
+        <ImageLightbox
+          src={src}
+          alt={item.name}
           onClose={() => setZoomed(false)}
-          images={[{ src, alt: item.name }]}
-          rotatable={false}
-          changeable={false}
-          noImgDetails
-          zIndex={VIEWER_Z_INDEX}
         />
       ) : null}
     </div>
