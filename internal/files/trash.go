@@ -99,6 +99,9 @@ func (s *Service) MoveToTrash(src *models.StorageSource, relInput string, actorU
 	if err := s.moveRecordsToTrashTx(tx, src, trashKey, plan, actorUserID, now); err != nil {
 		return nil, err
 	}
+	if err := s.AdjustSourceUsageTx(tx, src.ID, -plan.total); err != nil {
+		return nil, err
+	}
 	destinationReady, err := moveFilesystemTreeTracked(plan.sourceAbs, payloadAbs, func() error {
 		return s.markTrashOperationDestinationReady(trashKey)
 	})
@@ -347,6 +350,9 @@ func (s *Service) RestoreTrash(src *models.StorageSource, trashKey, targetInput 
 	if err := s.restoreRecordsTx(tx, src, entry, targetRel, actorUserID); err != nil {
 		return nil, err
 	}
+	if err := s.rebaseUserPathsTx(tx, src.ID, entry.OriginalRelativePath, src.ID, targetRel); err != nil {
+		return nil, err
+	}
 	destinationReady, err := moveFilesystemTreeTracked(payloadAbs, targetAbs, func() error {
 		return s.markTrashOperationDestinationReady(trashKey)
 	})
@@ -357,6 +363,13 @@ func (s *Service) RestoreTrash(src *models.StorageSource, trashKey, targetInput 
 		return nil, err
 	}
 	if _, err := tx.Exec(`DELETE FROM trash_entries WHERE trash_key = ?`, trashKey); err != nil {
+		if rollbackErr := moveFilesystemTree(targetAbs, payloadAbs); rollbackErr != nil {
+			removeOperationOnReturn = false
+			return nil, errors.Join(err, fmt.Errorf("回滚回收站恢复失败: %w", rollbackErr))
+		}
+		return nil, err
+	}
+	if err := s.AdjustSourceUsageTx(tx, src.ID, entry.Size); err != nil {
 		if rollbackErr := moveFilesystemTree(targetAbs, payloadAbs); rollbackErr != nil {
 			removeOperationOnReturn = false
 			return nil, errors.Join(err, fmt.Errorf("回滚回收站恢复失败: %w", rollbackErr))

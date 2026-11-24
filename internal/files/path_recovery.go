@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/managedroot"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
@@ -205,6 +206,9 @@ func (s *Service) movePathMetadata(storageSourceID int64, fromRel, toRel string,
 	if err := moveShareRecordsTx(tx, storageSourceID, storageSourceID, fromRel, toRel); err != nil {
 		return err
 	}
+	if err := s.rebaseUserPathsTx(tx, storageSourceID, fromRel, storageSourceID, toRel); err != nil {
+		return err
+	}
 	rows, err := tx.Query(`SELECT id, relative_path FROM file_records
   WHERE storage_source_id = ? AND record_status = ? AND `+relativePathSubtreeSQL,
 		appendRelativePathSubtreeArgs([]any{storageSourceID, models.FileRecordActive}, fromRel)...)
@@ -242,6 +246,10 @@ func (s *Service) movePathMetadata(storageSourceID int64, fromRel, toRel string,
 }
 
 func (s *Service) deletePathMetadata(storageSourceID int64, relPath string, isDir bool) error {
+	return s.deletePathMetadataWithDelta(storageSourceID, relPath, isDir, 0)
+}
+
+func (s *Service) deletePathMetadataWithDelta(storageSourceID int64, relPath string, isDir bool, usageDelta int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -270,6 +278,11 @@ func (s *Service) deletePathMetadata(storageSourceID int64, relPath string, isDi
 		}
 		if _, err := tx.Exec(`DELETE FROM file_records WHERE storage_source_id = ? AND relative_path = ? AND record_status = ?`,
 			storageSourceID, relPath, models.FileRecordActive); err != nil {
+			return err
+		}
+	}
+	if usageDelta != 0 {
+		if err := s.AdjustSourceUsageTx(tx, storageSourceID, usageDelta); err != nil {
 			return err
 		}
 	}
@@ -428,12 +441,8 @@ func (s *Service) RecoverPathOperations() (PathRecoveryResult, error) {
 	if err != nil {
 		return result, err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), ".operation-") && strings.HasSuffix(entry.Name(), ".tmp") {
-			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-				return result, err
-			}
-		}
+	if err := journal.CleanOrphans(dir, ".filesystem-ready", ".database-ready"); err != nil {
+		return result, err
 	}
 	entries, err = os.ReadDir(dir)
 	if err != nil {
@@ -488,6 +497,7 @@ func (s *Service) RecoverPathOperations() (PathRecoveryResult, error) {
 			if err := s.deletePathMetadata(src.ID, op.FromRelativePath, op.IsDirectory); err != nil {
 				return result, err
 			}
+			s.InvalidateSourceUsage(src.ID)
 			if err := s.markPathDatabaseReady(op.OperationID); err != nil {
 				return result, err
 			}

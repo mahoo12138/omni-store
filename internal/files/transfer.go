@@ -467,6 +467,9 @@ func (s *Service) syncTransferRecords(source, target *models.StorageSource, plan
 			return err
 		}
 	}
+	if err := s.AdjustSourceUsageTx(tx, target.ID, plan.total); err != nil {
+		return err
+	}
 	if move {
 		if _, err := tx.Exec(`DELETE FROM file_records WHERE storage_source_id = ? AND `+relativePathSubtreeSQL,
 			appendRelativePathSubtreeArgs([]any{source.ID}, plan.sourceRel)...); err != nil {
@@ -476,6 +479,12 @@ func (s *Service) syncTransferRecords(source, target *models.StorageSource, plan
 			return err
 		}
 		if err := moveShareRecordsTx(tx, source.ID, target.ID, plan.sourceRel, plan.targetRel); err != nil {
+			return err
+		}
+		if err := s.rebaseUserPathsTx(tx, source.ID, plan.sourceRel, target.ID, plan.targetRel); err != nil {
+			return err
+		}
+		if err := s.AdjustSourceUsageTx(tx, source.ID, -plan.total); err != nil {
 			return err
 		}
 	}

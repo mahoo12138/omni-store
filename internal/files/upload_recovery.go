@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
 )
@@ -25,6 +26,7 @@ type uploadOperation struct {
 	Version            int       `json:"version"`
 	OperationID        string    `json:"operation_id"`
 	StorageSourceID    int64     `json:"storage_source_id"`
+	Staging            bool      `json:"staging,omitempty"`
 	TempRelativePath   string    `json:"temp_relative_path"`
 	FinalRelativePath  string    `json:"final_relative_path"`
 	BackupRelativePath string    `json:"backup_relative_path,omitempty"`
@@ -110,6 +112,9 @@ func validateUploadOperationPlan(op uploadOperation) error {
 		!uploadTempName.MatchString(filepath.Base(filepath.FromSlash(op.TempRelativePath))) {
 		return fmt.Errorf("普通上传临时文件不在最终目录")
 	}
+	if op.Staging && (op.ReplacedExisting || op.BackupRelativePath != "") {
+		return fmt.Errorf("staging 普通上传不能提前包含覆盖或备份路径")
+	}
 	if op.ReplacedExisting {
 		normalized, err := security.NormalizeRelPath(op.BackupRelativePath)
 		if err != nil || normalized == "" || normalized != op.BackupRelativePath ||
@@ -124,6 +129,9 @@ func validateUploadOperationPlan(op uploadOperation) error {
 }
 
 func validatePreparedUploadOperation(op uploadOperation) error {
+	if op.Staging {
+		return fmt.Errorf("prepared 普通上传不能仍处于 staging 状态")
+	}
 	if err := validateUploadOperationPlan(op); err != nil {
 		return err
 	}
@@ -151,12 +159,48 @@ func sameUploadOperationPlan(plan, prepared uploadOperation) bool {
 		return (left == nil && right == nil) ||
 			(left != nil && right != nil && *left == *right)
 	}
-	return plan.Version == prepared.Version && plan.OperationID == prepared.OperationID &&
+	baseMatch := plan.Version == prepared.Version && plan.OperationID == prepared.OperationID &&
 		plan.StorageSourceID == prepared.StorageSourceID && plan.TempRelativePath == prepared.TempRelativePath &&
-		plan.FinalRelativePath == prepared.FinalRelativePath && plan.BackupRelativePath == prepared.BackupRelativePath &&
-		plan.ReplacedExisting == prepared.ReplacedExisting && plan.OwnerType == prepared.OwnerType &&
+		plan.FinalRelativePath == prepared.FinalRelativePath && plan.OwnerType == prepared.OwnerType &&
 		equalID(plan.OwnerUserID, prepared.OwnerUserID) && equalID(plan.ActorUserID, prepared.ActorUserID) &&
 		plan.CreatedAt.Equal(prepared.CreatedAt)
+	if !baseMatch {
+		return false
+	}
+	if plan.Staging {
+		return !prepared.Staging
+	}
+	return plan.BackupRelativePath == prepared.BackupRelativePath &&
+		plan.ReplacedExisting == prepared.ReplacedExisting
+}
+
+func (s *Service) newStagingUploadPlan(src *models.StorageSource, finalRel, ownerType string,
+	ownerUserID, actorUserID *int64) (uploadOperation, error) {
+	dir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(finalRel)))
+	tempName := ".omnistore-upload-" + auth.NewRandomToken("", 8) + ".tmp"
+	tempRel := tempName
+	if dir != "." {
+		tempRel = dir + "/" + tempName
+	}
+	op := uploadOperation{
+		Version: uploadOperationVersion, OperationID: auth.NewRandomToken("upl-", 12),
+		StorageSourceID: src.ID, Staging: true, TempRelativePath: tempRel, FinalRelativePath: finalRel,
+		OwnerType: ownerType, OwnerUserID: ownerUserID, ActorUserID: actorUserID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := validateUploadOperationPlan(op); err != nil {
+		return uploadOperation{}, err
+	}
+	return op, nil
+}
+
+func backupRelativePathForUpload(finalRel, operationID string) string {
+	dir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(finalRel)))
+	backupName := ".omnistore-upload-" + strings.TrimPrefix(operationID, "upl-") + ".backup"
+	if dir == "." {
+		return backupName
+	}
+	return dir + "/" + backupName
 }
 
 func (s *Service) newUploadOperationPlan(src *models.StorageSource, finalRel string,
@@ -268,30 +312,7 @@ func (s *Service) writeUploadOperationFile(target string, op uploadOperation) er
 }
 
 func createUploadMarker(path, dir string) error {
-	handle, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if errors.Is(err, fs.ErrExist) {
-		exists, checkErr := uploadMarkerExists(path)
-		if checkErr != nil {
-			return checkErr
-		}
-		if !exists {
-			return fmt.Errorf("普通上传阶段标记不存在")
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if err := handle.Sync(); err != nil {
-		_ = handle.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := handle.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	return syncDirectory(dir)
+	return journal.CreateMarker(path, dir)
 }
 
 func (s *Service) markUploadDatabaseReady(operationID string) error {
@@ -299,17 +320,7 @@ func (s *Service) markUploadDatabaseReady(operationID string) error {
 }
 
 func uploadMarkerExists(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("普通上传阶段标记 %s 不是普通文件", filepath.Base(path))
-	}
-	return true, nil
+	return journal.MarkerExists(path)
 }
 
 func (s *Service) uploadPaths(op uploadOperation, src *models.StorageSource) (tempAbs, finalAbs, backupAbs string, err error) {
@@ -358,6 +369,25 @@ func uploadFileMatches(absPath string, info os.FileInfo, op uploadOperation) (bo
 	return fmt.Sprintf("%x", hasher.Sum(nil)) == op.ContentSHA256, nil
 }
 
+func (s *Service) installUploadedFileRoot(srcRoot *security.SourceRoot, op uploadOperation) error {
+	parentRel := relParentDir(op.FinalRelativePath)
+	if op.ReplacedExisting {
+		if err := srcRoot.Rename(op.FinalRelativePath, op.BackupRelativePath); err != nil {
+			return fmt.Errorf("保留被覆盖文件失败: %w", err)
+		}
+		if err := srcRoot.SyncDir(parentRel); err != nil {
+			return fmt.Errorf("同步上传备份目录失败: %w", err)
+		}
+	}
+	if err := srcRoot.Rename(op.TempRelativePath, op.FinalRelativePath); err != nil {
+		return fmt.Errorf("提交上传文件失败: %w", err)
+	}
+	if err := srcRoot.SyncDir(parentRel); err != nil {
+		return fmt.Errorf("同步上传目标目录失败: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) installUploadedFile(op uploadOperation, tempAbs, finalAbs string) error {
 	if op.ReplacedExisting {
 		backupAbs := filepath.Join(filepath.Dir(finalAbs), filepath.Base(filepath.FromSlash(op.BackupRelativePath)))
@@ -395,19 +425,23 @@ func (s *Service) rollbackPlannedUpload(op uploadOperation, src *models.StorageS
 	if err != nil {
 		return err
 	}
-	finalExists, _, err := checkedUploadFile(finalAbs, op.FinalRelativePath)
-	if err != nil {
-		return err
-	}
-	backupExists := false
-	if backupAbs != "" {
-		backupExists, _, err = checkedUploadFile(backupAbs, op.BackupRelativePath)
+	// 两阶段上传的 Phase 1（Staging=true）尚未持有路径锁也未接触最终目标，
+	// 崩溃回滚只需清理本操作独占的临时文件，不受并发写入对 final 的合法变更影响。
+	if !op.Staging {
+		finalExists, _, err := checkedUploadFile(finalAbs, op.FinalRelativePath)
 		if err != nil {
 			return err
 		}
-	}
-	if (!op.ReplacedExisting && finalExists) || (op.ReplacedExisting && (!finalExists || backupExists)) {
-		return fmt.Errorf("planned 普通上传 %s 的最终路径状态异常，已保留现场", op.OperationID)
+		backupExists := false
+		if backupAbs != "" {
+			backupExists, _, err = checkedUploadFile(backupAbs, op.BackupRelativePath)
+			if err != nil {
+				return err
+			}
+		}
+		if (!op.ReplacedExisting && finalExists) || (op.ReplacedExisting && (!finalExists || backupExists)) {
+			return fmt.Errorf("planned 普通上传 %s 的最终路径状态异常，已保留现场", op.OperationID)
+		}
 	}
 	if tempExists {
 		if err := os.Remove(tempAbs); err != nil {
@@ -724,6 +758,7 @@ func (s *Service) RecoverFileUploadOperations() (FileUploadRecoveryResult, error
 			if err := s.RecordFile(src, op.FinalRelativePath, op.OwnerType, op.OwnerUserID, op.ActorUserID); err != nil {
 				return result, fmt.Errorf("完成普通上传 %s 台账失败: %w", op.OperationID, err)
 			}
+			s.InvalidateSourceUsage(src.ID)
 			if err := s.markUploadDatabaseReady(op.OperationID); err != nil {
 				return result, err
 			}

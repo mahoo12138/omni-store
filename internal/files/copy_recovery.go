@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
 )
@@ -259,13 +260,8 @@ func (s *Service) RecoverCopyOperations() (CopyRecoveryResult, error) {
 	if err != nil {
 		return result, err
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".operation-") || !strings.HasSuffix(entry.Name(), ".tmp") {
-			continue
-		}
-		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-			return result, err
-		}
+	if err := journal.CleanOrphans(dir, ".database-ready"); err != nil {
+		return result, err
 	}
 	entries, err = os.ReadDir(dir)
 	if err != nil {

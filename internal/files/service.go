@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
@@ -87,10 +88,67 @@ func (g *QuotaWriteGuard) Close() {
 // Service 提供核心文件操作，REST、WebDAV、图床、公开网盘共用。
 type Service struct {
 	db              *sql.DB
+	rdb             *sql.DB
 	sources         *sources.Service
 	locks           *locks.Manager
+	lifecycle       *lifecycle.Manager
 	persistentLocks *locks.PersistentStore
 	trashDir        string
+	usageMu         sync.Mutex
+	usageEpochs     map[int64]uint64
+	caseMu          sync.Mutex
+	probedCase      map[string]string // sourceKey -> probed rootPath
+	recentMu        sync.Mutex
+	recentCache     map[string]time.Time
+}
+
+// SetLifecycle 注入实例级生命周期锁管理器（避免测试与多实例共享包级全局状态）。
+func (s *Service) SetLifecycle(mgr *lifecycle.Manager) {
+	s.lifecycle = mgr
+}
+
+func (s *Service) lifecycleManager() *lifecycle.Manager {
+	if s.lifecycle != nil {
+		return s.lifecycle
+	}
+	return lifecycle.Default()
+}
+
+func (s *Service) ensureSourceCasePolicy(src *models.StorageSource) {
+	if src == nil || src.Key == "" || src.RootPath == "" || s.locks == nil {
+		return
+	}
+	s.caseMu.Lock()
+	if s.probedCase == nil {
+		s.probedCase = make(map[string]string)
+	}
+	if s.probedCase[src.Key] == src.RootPath {
+		s.caseMu.Unlock()
+		return
+	}
+	s.caseMu.Unlock()
+
+	ci := security.ProbeCaseInsensitive(src.RootPath)
+	s.locks.SetSourceCaseInsensitive(src.Key, ci)
+
+	s.caseMu.Lock()
+	s.probedCase[src.Key] = src.RootPath
+	s.caseMu.Unlock()
+}
+
+func (s *Service) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
+}
+
+// SetReadDB 注入只读连接池，使热路径 SELECT 在 WAL 模式下并发执行。
+func (s *Service) SetReadDB(rdb *sql.DB) {
+	s.rdb = rdb
+	if s.persistentLocks != nil {
+		s.persistentLocks.SetReadDB(rdb)
+	}
 }
 
 func (s *Service) guardLifecycle(storageSources []*models.StorageSource, userID *int64) (func(), error) {
@@ -103,7 +161,7 @@ func (s *Service) guardLifecycle(storageSources []*models.StorageSource, userID 
 	if userID != nil {
 		keys = append(keys, lifecycle.User(*userID))
 	}
-	release := lifecycle.Read(keys...)
+	release := s.lifecycleManager().Read(keys...)
 	for _, expected := range storageSources {
 		if expected == nil {
 			continue
@@ -148,42 +206,6 @@ func (s *Service) PersistentLocks() *locks.PersistentStore {
 // StorageSourceByID 返回文件恢复流程使用的存储源快照。
 func (s *Service) StorageSourceByID(storageSourceID int64) (*models.StorageSource, error) {
 	return s.sources.GetByID(storageSourceID)
-}
-
-// StorageUsage 实时统计存储源内全部普通文件，不跟随 symlink；排除规则和保留名称
-// 都不减少物理用量。文件名不是内部所有权证明，宿主机写入的同名文件必须计量。
-func (s *Service) StorageUsage(src *models.StorageSource) (int64, error) {
-	root, err := security.ResolveInSource(src.RootPath, "")
-	if err != nil {
-		return 0, err
-	}
-	var usage int64
-	err = filepath.WalkDir(root, func(absPath string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if os.IsNotExist(walkErr) {
-				return nil
-			}
-			return walkErr
-		}
-		if absPath == root {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if info.Mode().IsRegular() {
-			usage += info.Size()
-		}
-		return nil
-	})
-	return usage, err
 }
 
 // StorageQuota 返回实时用量和剩余配额。
@@ -349,6 +371,7 @@ func (s *Service) applyUserQuotaGuard(guard *QuotaWriteGuard, userID, storageSou
 // prepare 执行统一前置检查：规范化路径 -> 保留名称 -> 排除规则 -> symlink 检查。
 // 返回规范化相对路径和绝对路径。
 func (s *Service) prepare(src *models.StorageSource, relInput string) (relPath, absPath string, err error) {
+	s.ensureSourceCasePolicy(src)
 	relPath, err = security.NormalizeRelPath(relInput)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %s", ErrInvalid, err)
@@ -416,38 +439,51 @@ func (s *Service) prepareManaged(src *models.StorageSource, relInput, scopeDir s
 	return relPath, absPath, nil
 }
 
+func mapRootFSError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, security.ErrSymlink) {
+		return ErrUnsupported
+	}
+	if os.IsNotExist(err) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func relParentDir(relPath string) string {
+	parent := path.Dir(relPath)
+	if parent == "." || parent == "/" {
+		return ""
+	}
+	return parent
+}
+
 // OpenManagedForRead 打开源托管命名空间内由受信任服务写入的文件。
 // 调用方（如图床 /i/ 服务）必须以自己的业务记录构造路径，不得拼接用户输入。
+// 读锁仅在路径检查、通过 *os.Root 打开与 fstat 期间持有，打开成功后立即释放。
 func (s *Service) OpenManagedForRead(src *models.StorageSource, relInput, scopeDir string) (*os.File, os.FileInfo, func(), error) {
-	relPath, absPath, err := s.prepareManaged(src, relInput, scopeDir)
+	relPath, _, err := s.prepareManaged(src, relInput, scopeDir)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	unlock := s.locks.RLock(locks.Key(src.Key, relPath))
+	defer unlock()
 
-	info, err := os.Lstat(absPath)
+	f, openedInfo, err := srcRoot.OpenNoFollow(relPath)
 	if err != nil {
-		unlock()
-		if os.IsNotExist(err) {
-			return nil, nil, nil, ErrNotFound
-		}
-		return nil, nil, nil, err
+		return nil, nil, nil, mapRootFSError(err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		unlock()
-		return nil, nil, nil, ErrUnsupported
-	}
-	if !info.Mode().IsRegular() {
-		unlock()
+	if !openedInfo.Mode().IsRegular() {
+		_ = f.Close()
 		return nil, nil, nil, fmt.Errorf("%w: 内部路径不是普通文件", ErrInvalid)
 	}
-
-	f, err := os.Open(absPath)
-	if err != nil {
-		unlock()
-		return nil, nil, nil, err
-	}
-	return f, info, unlock, nil
+	return f, openedInfo, func() {}, nil
 }
 
 // DeleteManaged 删除托管命名空间内的服务数据（物理子树 + 内部台账行）。
@@ -469,34 +505,37 @@ func (s *Service) DeleteManaged(src *models.StorageSource, relInput, scopeDir st
 	}
 	defer releasePersistent()
 
+	srcRoot, err := s.sources.OpenRoot(src)
+	if err != nil {
+		return err
+	}
 	unlock := s.locks.Lock(locks.Key(src.Key, relPath))
 	defer unlock()
 
-	info, err := os.Lstat(absPath)
+	info, err := srcRoot.Lstat(relPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrNotFound
-		}
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return ErrUnsupported
+		return mapRootFSError(err)
 	}
 
+	deletedBytes := physicalSubtreeBytes(absPath)
 	op := s.newPathOperation(pathOperationDelete, src, relPath, "", info.IsDir(), nil)
 	if err := s.writePathOperation(op); err != nil {
 		return fmt.Errorf("记录内部删除意图失败: %w", err)
 	}
-	if err := os.RemoveAll(absPath); err != nil {
+	if err := srcRoot.RemoveAll(relPath); err != nil {
+		if errors.Is(err, security.ErrSymlink) {
+			_ = s.removePathOperation(op.OperationID)
+			return ErrUnsupported
+		}
 		return fmt.Errorf("删除内部数据失败，操作将在重启时继续: %w", err)
 	}
-	if err := syncPathParents(absPath); err != nil {
+	if err := srcRoot.SyncDir(relParentDir(relPath)); err != nil {
 		return fmt.Errorf("同步内部删除目录失败，操作将在重启时继续: %w", err)
 	}
 	if err := s.markPathFilesystemReady(op.OperationID); err != nil {
 		return fmt.Errorf("记录内部删除文件阶段失败，操作将在重启时继续: %w", err)
 	}
-	if err := s.deletePathMetadata(src.ID, relPath, info.IsDir()); err != nil {
+	if err := s.deletePathMetadataWithDelta(src.ID, relPath, info.IsDir(), -deletedBytes); err != nil {
 		return fmt.Errorf("清理内部路径元数据失败，操作将在重启时继续: %w", err)
 	}
 	if err := s.markPathDatabaseReady(op.OperationID); err != nil {
@@ -555,7 +594,7 @@ type ListResult struct {
 // List 实时扫描目录并过滤、排序、分页。
 // includeUnsupported 为 false 时隐藏 symlink（公开侧）。
 func (s *Service) List(src *models.StorageSource, relInput string, opts ListOptions, includeUnsupported bool) (*ListResult, error) {
-	relPath, absPath, err := s.prepare(src, relInput)
+	relPath, _, err := s.prepare(src, relInput)
 	if err != nil {
 		return nil, err
 	}
@@ -570,13 +609,18 @@ func (s *Service) List(src *models.StorageSource, relInput string, opts ListOpti
 		opts.PageSize = 500
 	}
 
+	srcRoot, err := s.sources.OpenRoot(src)
+	if err != nil {
+		return nil, err
+	}
 	unlock := s.locks.RLock(locks.Key(src.Key, relPath))
 	defer unlock()
 
-	dirents, err := os.ReadDir(absPath)
+	dirents, err := srcRoot.ReadDir(relPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotFound
+		mapped := mapRootFSError(err)
+		if errors.Is(mapped, ErrNotFound) || errors.Is(mapped, ErrUnsupported) {
+			return nil, mapped
 		}
 		return nil, fmt.Errorf("读取目录失败: %w", err)
 	}
@@ -707,19 +751,32 @@ func (s *Service) ListObjects(src *models.StorageSource) ([]ObjectEntry, error) 
 
 // EnsureObjectParents 创建对象 Key 所需的父目录，复用统一路径与锁检查。
 func (s *Service) EnsureObjectParents(src *models.StorageSource, objectKey string) error {
+	_, err := s.EnsureObjectParentsCreated(src, objectKey)
+	return err
+}
+
+// EnsureObjectParentsCreated 创建对象 Key 所需的父目录，并返回本次新建的目录列表
+// （按从浅到深顺序），便于后续上传失败时仅回滚本次创建的空目录。
+func (s *Service) EnsureObjectParentsCreated(src *models.StorageSource, objectKey string) ([]string, error) {
 	normalized, err := security.NormalizeRelPath(objectKey)
 	if err != nil {
-		return fmt.Errorf("%w: %s", ErrInvalid, err)
+		return nil, fmt.Errorf("%w: %s", ErrInvalid, err)
 	}
 	parent := path.Dir(normalized)
 	if parent == "." || parent == "" {
-		return nil
+		return nil, nil
 	}
 	current := ""
+	var created []string
 	for _, segment := range strings.Split(parent, "/") {
-		_, err := s.Mkdir(src, current, segment)
-		if err != nil && !errors.Is(err, ErrAlreadyExists) {
-			return err
+		relPath, err := s.Mkdir(src, current, segment)
+		if err != nil {
+			if !errors.Is(err, ErrAlreadyExists) {
+				s.CleanupEmptyDirs(src, created)
+				return nil, err
+			}
+		} else {
+			created = append(created, relPath)
 		}
 		if current == "" {
 			current = segment
@@ -727,7 +784,24 @@ func (s *Service) EnsureObjectParents(src *models.StorageSource, objectKey strin
 			current += "/" + segment
 		}
 	}
-	return nil
+	return created, nil
+}
+
+// CleanupEmptyDirs 逆序删除给定的空目录（非空目录会被安全跳过，避免影响并发写入）。
+func (s *Service) CleanupEmptyDirs(src *models.StorageSource, relDirs []string) {
+	srcRoot, err := s.sources.OpenRoot(src)
+	if err != nil {
+		return
+	}
+	for i := len(relDirs) - 1; i >= 0; i-- {
+		relPath, _, err := s.prepare(src, relDirs[i])
+		if err != nil || relPath == "" {
+			continue
+		}
+		unlock := s.locks.Lock(locks.Key(src.Key, relPath))
+		_ = srcRoot.Remove(relPath)
+		unlock()
+	}
 }
 
 // sortEntries 排序：目录永远排在文件前（README §13.8），同键值内按名称升序。
@@ -781,19 +855,20 @@ func sortEntries(entries []Entry, sortKey, order string) {
 
 // Stat 返回单个文件/目录的基础信息。
 func (s *Service) Stat(src *models.StorageSource, relInput string) (*Entry, error) {
-	relPath, absPath, err := s.prepare(src, relInput)
+	relPath, _, err := s.prepare(src, relInput)
+	if err != nil {
+		return nil, err
+	}
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return nil, err
 	}
 	unlock := s.locks.RLock(locks.Key(src.Key, relPath))
 	defer unlock()
 
-	info, err := os.Lstat(absPath)
+	info, err := srcRoot.LstatRaw(relPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotFound
-		}
-		return nil, err
+		return nil, mapRootFSError(err)
 	}
 	e := &Entry{Name: path.Base("/" + relPath), MTime: info.ModTime()}
 	switch {
@@ -813,37 +888,41 @@ func (s *Service) Stat(src *models.StorageSource, relInput string) (*Entry, erro
 // --- 下载（README §13.9 流式 + Range） ---
 
 // OpenForRead 打开文件用于流式下载。
-// 调用方负责 Close 文件和调用 unlock；期间持有读锁。
+// 读锁仅在路径安全校验、通过 *os.Root 打开和 fstat 期间持有；打开成功后立即释放，
+// 已打开的 fd 不受后续 temp+rename 替换影响，避免长下载阻塞祖先目录 List。
 func (s *Service) OpenForRead(src *models.StorageSource, relInput string) (*os.File, os.FileInfo, func(), error) {
-	relPath, absPath, err := s.prepare(src, relInput)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	unlock := s.locks.RLock(locks.Key(src.Key, relPath))
+	return s.OpenForReadContext(context.Background(), src, relInput)
+}
 
-	info, err := os.Lstat(absPath)
+// OpenForReadContext 打开文件用于流式下载，支持在等待锁时响应 ctx 取消。
+func (s *Service) OpenForReadContext(ctx context.Context, src *models.StorageSource, relInput string) (*os.File, os.FileInfo, func(), error) {
+	relPath, _, err := s.prepare(src, relInput)
 	if err != nil {
-		unlock()
-		if os.IsNotExist(err) {
-			return nil, nil, nil, ErrNotFound
-		}
 		return nil, nil, nil, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		unlock()
-		return nil, nil, nil, ErrUnsupported
+	srcRoot, err := s.sources.OpenRoot(src)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if info.IsDir() {
-		unlock()
+	unlock, err := s.locks.RLockContext(ctx, locks.Key(src.Key, relPath))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer unlock()
+
+	f, openedInfo, err := srcRoot.OpenNoFollow(relPath)
+	if err != nil {
+		return nil, nil, nil, mapRootFSError(err)
+	}
+	if openedInfo.IsDir() {
+		_ = f.Close()
 		return nil, nil, nil, fmt.Errorf("%w: 不能下载目录", ErrInvalid)
 	}
-
-	f, err := os.Open(absPath)
-	if err != nil {
-		unlock()
-		return nil, nil, nil, err
+	if !openedInfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, nil, nil, ErrUnsupported
 	}
-	return f, info, unlock, nil
+	return f, openedInfo, func() {}, nil
 }
 
 // --- 创建目录 ---
@@ -872,7 +951,11 @@ func (s *Service) MkdirWithLockTokens(src *models.StorageSource, parentRel, name
 		target = parent + "/" + name
 	}
 
-	relPath, absPath, err := s.prepare(src, target)
+	relPath, _, err := s.prepare(src, target)
+	if err != nil {
+		return "", err
+	}
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return "", err
 	}
@@ -886,10 +969,18 @@ func (s *Service) MkdirWithLockTokens(src *models.StorageSource, parentRel, name
 	unlock := s.locks.Lock(locks.Key(src.Key, relPath))
 	defer unlock()
 
-	if _, err := os.Lstat(absPath); err == nil {
+	if _, err := srcRoot.LstatRaw(relPath); err == nil {
 		return "", ErrAlreadyExists
+	} else if !os.IsNotExist(err) {
+		return "", mapRootFSError(err)
 	}
-	if err := os.Mkdir(absPath, 0o755); err != nil {
+	if err := srcRoot.Mkdir(relPath, 0o755); err != nil {
+		if errors.Is(err, security.ErrSymlink) {
+			return "", ErrUnsupported
+		}
+		if os.IsExist(err) {
+			return "", ErrAlreadyExists
+		}
 		if os.IsNotExist(err) {
 			return "", fmt.Errorf("%w: 父目录不存在", ErrInvalid)
 		}
@@ -908,6 +999,9 @@ func (s *Service) Upload(src *models.StorageSource, dirRel, filename string, bod
 }
 
 // UploadWithLockTokens 上传文件，并允许 WebDAV 提交匹配的持久锁 Token。
+// 采用两阶段提交避免慢客户端在网络读取期间阻塞配额锁与祖先目录读锁：
+// 1. 无锁阶段：快速校验目标与乐观配额上限，流式写入 journal 登记的同目录临时文件并计算 SHA-256；
+// 2. 短临界区：获取持久锁、配额锁与路径写锁，复核覆盖冲突与精确配额，原子发布并更新台账与增量用量。
 func (s *Service) UploadWithLockTokens(src *models.StorageSource, dirRel, filename string, body io.Reader, overwrite bool, lockTokens []string, lockOwnerUserID *int64) (string, int64, error) {
 	releaseLifecycle, err := s.guardLifecycle([]*models.StorageSource{src}, lockOwnerUserID)
 	if err != nil {
@@ -926,55 +1020,56 @@ func (s *Service) UploadWithLockTokens(src *models.StorageSource, dirRel, filena
 		target = dir + "/" + filename
 	}
 
-	relPath, absPath, err := s.prepare(src, target)
+	relPath, _, err := s.prepare(src, target)
 	if err != nil {
 		return "", 0, err
 	}
-	releasePersistent, err := s.persistentLocks.GuardMutation(context.Background(), src.ID,
-		[]locks.MutationScope{{Path: relPath}}, lockTokens, lockOwnerUserID)
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return "", 0, err
 	}
-	defer releasePersistent()
-	quotaGuard, err := s.BeginQuotaWriteForUser(src, relPath, lockOwnerUserID)
-	if err != nil {
-		return "", 0, err
-	}
-	defer quotaGuard.Close()
 
-	unlock := s.locks.Lock(locks.Key(src.Key, relPath))
-	defer unlock()
-
-	// 冲突检查（README §13.4）。
-	replacedExisting := false
-	if info, err := os.Lstat(absPath); err == nil {
+	// 快速前置校验：明显冲突或父目录缺失时不白白缓冲整个上传体。
+	if info, statErr := srcRoot.Lstat(relPath); statErr == nil {
 		if info.IsDir() {
 			return "", 0, fmt.Errorf("%w: 文件不能覆盖目录", ErrInvalid)
 		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		if !info.Mode().IsRegular() {
 			return "", 0, ErrUnsupported
 		}
 		if !overwrite {
 			return "", 0, ErrAlreadyExists
 		}
-		replacedExisting = true
-	} else if !os.IsNotExist(err) {
-		return "", 0, err
+	} else if !os.IsNotExist(statErr) {
+		return "", 0, mapRootFSError(statErr)
 	}
 
-	parentAbs := filepath.Dir(absPath)
-	if info, err := os.Stat(parentAbs); err != nil || !info.IsDir() {
+	parentRel := relParentDir(relPath)
+	if info, statErr := srcRoot.Lstat(parentRel); statErr != nil || !info.IsDir() {
+		if errors.Is(statErr, security.ErrSymlink) {
+			return "", 0, ErrUnsupported
+		}
 		return "", 0, fmt.Errorf("%w: 目标目录不存在", ErrInvalid)
 	}
 
-	maxBytes, limited := quotaGuard.MaxBytes()
+	replacingForHint := ""
+	if overwrite {
+		replacingForHint = relPath
+	}
+	optimisticMaxBytes, optimisticLimited, err := s.OptimisticQuotaBound(src, replacingForHint, lockOwnerUserID)
+	if err != nil {
+		return "", 0, err
+	}
+
 	ownerType := models.FileOwnerUnowned
 	var ownerUserID *int64
 	if lockOwnerUserID != nil {
 		ownerType = models.FileOwnerUser
 		ownerUserID = lockOwnerUserID
 	}
-	op, err := s.newUploadOperationPlan(src, relPath, replacedExisting, ownerType, ownerUserID, lockOwnerUserID)
+
+	// Phase 1（无锁）：登记 staging journal 并通过 *os.Root 流式落盘临时文件。
+	op, err := s.newStagingUploadPlan(src, relPath, ownerType, ownerUserID, lockOwnerUserID)
 	if err != nil {
 		return "", 0, err
 	}
@@ -987,22 +1082,69 @@ func (s *Service) UploadWithLockTokens(src *models.StorageSource, dirRel, filena
 			_ = s.removeUploadJournal(op.OperationID)
 		}
 	}()
-	tmpPath, _, _, err := s.uploadPaths(op, src)
+	written, contentSHA256, mtimeUnixNano, err := writeUploadTempAtRoot(srcRoot, op.TempRelativePath, body, optimisticMaxBytes, optimisticLimited)
 	if err != nil {
-		return "", 0, err
-	}
-	written, contentSHA256, mtimeUnixNano, err := writeUploadTempAt(tmpPath, body, maxBytes, limited)
-	if err != nil {
-		return "", 0, err
+		return "", 0, mapRootFSError(err)
 	}
 	keepTemp := true
 	defer func() {
 		if keepTemp {
-			_ = os.Remove(tmpPath)
+			_ = srcRoot.Remove(op.TempRelativePath)
 		}
 	}()
-	if err := syncDirectory(parentAbs); err != nil {
+	if err := srcRoot.SyncDir(parentRel); err != nil {
 		return "", 0, fmt.Errorf("同步上传临时目录失败: %w", err)
+	}
+
+	// Phase 2（短临界区）：获取锁 → 复核冲突、配额与路径安全 → 通过 *os.Root 原子发布 → 更新台账与增量用量。
+	releasePersistent, err := s.persistentLocks.GuardMutation(context.Background(), src.ID,
+		[]locks.MutationScope{{Path: relPath}}, lockTokens, lockOwnerUserID)
+	if err != nil {
+		return "", 0, err
+	}
+	defer releasePersistent()
+
+	quotaGuard, err := s.BeginQuotaWriteForUser(src, relPath, lockOwnerUserID)
+	if err != nil {
+		return "", 0, err
+	}
+	defer quotaGuard.Close()
+
+	unlock := s.locks.Lock(locks.Key(src.Key, relPath))
+	defer unlock()
+
+	// 流式接收期间规则或目录可能变化，进入临界区后重新做安全解析。
+	relPath, _, err = s.prepare(src, target)
+	if err != nil {
+		return "", 0, err
+	}
+
+	replacedExisting := false
+	var replacedBytes int64
+	if info, statErr := srcRoot.Lstat(relPath); statErr == nil {
+		if info.IsDir() {
+			return "", 0, fmt.Errorf("%w: 文件不能覆盖目录", ErrInvalid)
+		}
+		if !info.Mode().IsRegular() {
+			return "", 0, ErrUnsupported
+		}
+		if !overwrite {
+			return "", 0, ErrAlreadyExists
+		}
+		replacedExisting = true
+		replacedBytes = info.Size()
+	} else if !os.IsNotExist(statErr) {
+		return "", 0, mapRootFSError(statErr)
+	}
+
+	if maxBytes, limited := quotaGuard.MaxBytes(); limited && written > maxBytes {
+		return "", 0, ErrQuotaExceeded
+	}
+
+	op.Staging = false
+	op.ReplacedExisting = replacedExisting
+	if replacedExisting {
+		op.BackupRelativePath = backupRelativePathForUpload(relPath, op.OperationID)
 	}
 	op.Size, op.ContentSHA256, op.MTimeUnixNano = written, contentSHA256, mtimeUnixNano
 	if err := s.writePreparedUploadOperation(op); err != nil {
@@ -1010,13 +1152,13 @@ func (s *Service) UploadWithLockTokens(src *models.StorageSource, dirRel, filena
 	}
 	keepJournal = false
 	keepTemp = false // prepared journal 已持久接管清理与恢复。
-	if err := s.installUploadedFile(op, tmpPath, absPath); err != nil {
+	if err := s.installUploadedFileRoot(srcRoot, op); err != nil {
 		if rollbackErr := s.rollbackUploadOperation(op, src); rollbackErr != nil {
 			return "", 0, fmt.Errorf("提交上传文件失败: %w；回滚上传失败: %v", err, rollbackErr)
 		}
-		return "", 0, err
+		return "", 0, mapRootFSError(err)
 	}
-	if err := s.RecordFile(src, relPath, ownerType, ownerUserID, lockOwnerUserID); err != nil {
+	if err := s.recordUploadedFileWithDelta(src, relPath, ownerType, ownerUserID, lockOwnerUserID, written-replacedBytes); err != nil {
 		if rollbackErr := s.rollbackUploadOperation(op, src); rollbackErr != nil {
 			return "", 0, fmt.Errorf("更新文件台账失败: %w；回滚上传失败: %v", err, rollbackErr)
 		}
@@ -1035,6 +1177,8 @@ func (s *Service) UploadWithLockTokens(src *models.StorageSource, dirRel, filena
 }
 
 // writeViaTemp 写同目录临时文件后原子重命名到目标（README §14.3/§14.4）。
+// 直接依赖 os.Rename 原子替换（Unix 为 rename(2)，Windows 亦通过 MoveFileExW
+// 原子覆盖），绝不先删除目标再重命名，避免二次失败导致原文件永久丢失。
 func writeViaTemp(dirAbs, targetAbs string, body io.Reader, maxBytes int64, limited bool) (int64, error) {
 	tmpPath, written, _, err := writeUploadTemp(dirAbs, body, maxBytes, limited)
 	if err != nil {
@@ -1042,15 +1186,8 @@ func writeViaTemp(dirAbs, targetAbs string, body io.Reader, maxBytes int64, limi
 	}
 
 	if err := os.Rename(tmpPath, targetAbs); err != nil {
-		// Windows 开发环境下 rename 不能覆盖已有文件，先删再改名。
-		// 生产目标 Linux 上同目录 rename 原子替换。
-		if rmErr := os.Remove(targetAbs); rmErr == nil {
-			err = os.Rename(tmpPath, targetAbs)
-		}
-		if err != nil {
-			os.Remove(tmpPath)
-			return 0, fmt.Errorf("重命名临时文件失败: %w", err)
-		}
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("重命名临时文件失败: %w", err)
 	}
 	return written, nil
 }
@@ -1059,6 +1196,51 @@ func writeUploadTemp(dirAbs string, body io.Reader, maxBytes int64, limited bool
 	tmpPath := filepath.Join(dirAbs, ".omnistore-upload-"+auth.NewRandomToken("", 8)+".tmp")
 	written, digest, _, err := writeUploadTempAt(tmpPath, body, maxBytes, limited)
 	return tmpPath, written, digest, err
+}
+
+func writeUploadTempAtRoot(srcRoot *security.SourceRoot, tempRel string, body io.Reader, maxBytes int64, limited bool) (int64, string, int64, error) {
+	tmp, err := srcRoot.OpenFileNoFollow(tempRel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if errors.Is(err, security.ErrSymlink) {
+			return 0, "", 0, ErrUnsupported
+		}
+		return 0, "", 0, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = srcRoot.Remove(tempRel)
+	}
+
+	reader := body
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if limited && maxBytes < maxInt64 {
+		reader = io.LimitReader(body, maxBytes+1)
+	}
+	hasher := sha256.New()
+	written, err := io.Copy(io.MultiWriter(tmp, hasher), reader)
+	if err != nil {
+		cleanup()
+		return 0, "", 0, fmt.Errorf("写入失败: %w", err)
+	}
+	if limited && written > maxBytes {
+		cleanup()
+		return 0, "", 0, ErrQuotaExceeded
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return 0, "", 0, fmt.Errorf("落盘失败: %w", err)
+	}
+	info, statErr := tmp.Stat()
+	if err := tmp.Close(); err != nil {
+		_ = srcRoot.Remove(tempRel)
+		return 0, "", 0, fmt.Errorf("关闭临时文件失败: %w", err)
+	}
+	if statErr != nil || !info.Mode().IsRegular() || info.Size() != written {
+		_ = srcRoot.Remove(tempRel)
+		return 0, "", 0, errors.Join(ErrUnsupported, statErr)
+	}
+	return written, fmt.Sprintf("%x", hasher.Sum(nil)), info.ModTime().UnixNano(), nil
 }
 
 func writeUploadTempAt(tmpPath string, body io.Reader, maxBytes int64, limited bool) (int64, string, int64, error) {
@@ -1131,18 +1313,16 @@ func (s *Service) DeleteWithLockTokens(src *models.StorageSource, relInput strin
 	}
 	defer releasePersistent()
 
+	srcRoot, err := s.sources.OpenRoot(src)
+	if err != nil {
+		return err
+	}
 	unlock := s.locks.Lock(locks.Key(src.Key, relPath))
 	defer unlock()
 
-	info, err := os.Lstat(absPath)
+	info, err := srcRoot.Lstat(relPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrNotFound
-		}
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return ErrUnsupported
+		return mapRootFSError(err)
 	}
 
 	isDir := info.IsDir()
@@ -1151,20 +1331,25 @@ func (s *Service) DeleteWithLockTokens(src *models.StorageSource, relInput strin
 			return err
 		}
 	}
+	deletedBytes := physicalSubtreeBytes(absPath)
 	op := s.newPathOperation(pathOperationDelete, src, relPath, "", isDir, lockOwnerUserID)
 	if err := s.writePathOperation(op); err != nil {
 		return fmt.Errorf("记录永久删除意图失败: %w", err)
 	}
-	if err := os.RemoveAll(absPath); err != nil {
+	if err := srcRoot.RemoveAll(relPath); err != nil {
+		if errors.Is(err, security.ErrSymlink) {
+			_ = s.removePathOperation(op.OperationID)
+			return ErrUnsupported
+		}
 		return fmt.Errorf("删除失败，操作将在重启时继续: %w", err)
 	}
-	if err := syncPathParents(absPath); err != nil {
+	if err := srcRoot.SyncDir(relParentDir(relPath)); err != nil {
 		return fmt.Errorf("同步永久删除目录失败，操作将在重启时继续: %w", err)
 	}
 	if err := s.markPathFilesystemReady(op.OperationID); err != nil {
 		return fmt.Errorf("记录永久删除文件阶段失败，操作将在重启时继续: %w", err)
 	}
-	if err := s.deletePathMetadata(src.ID, relPath, isDir); err != nil {
+	if err := s.deletePathMetadataWithDelta(src.ID, relPath, isDir, -deletedBytes); err != nil {
 		return fmt.Errorf("清理路径元数据失败，操作将在重启时继续: %w", err)
 	}
 	if err := s.markPathDatabaseReady(op.OperationID); err != nil {
@@ -1242,7 +1427,7 @@ func (s *Service) move(src *models.StorageSource, fromRel, toRel string, lockTok
 	if err != nil {
 		return "", err
 	}
-	toRel, toAbs, err := s.prepare(src, toRel)
+	toRel, _, err = s.prepare(src, toRel)
 	if err != nil {
 		return "", err
 	}
@@ -1256,28 +1441,32 @@ func (s *Service) move(src *models.StorageSource, fromRel, toRel string, lockTok
 	}
 	defer releasePersistent()
 
+	srcRoot, err := s.sources.OpenRoot(src)
+	if err != nil {
+		return "", err
+	}
 	unlock := s.locks.LockPair(locks.Key(src.Key, fromRel), locks.Key(src.Key, toRel))
 	defer unlock()
 
-	info, err := os.Lstat(fromAbs)
+	info, err := srcRoot.Lstat(fromRel)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return "", ErrNotFound
-		}
-		return "", err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "", ErrUnsupported
+		return "", mapRootFSError(err)
 	}
 	if info.IsDir() {
 		if err := rejectManagedSubtree(fromAbs); err != nil {
 			return "", err
 		}
 	}
-	if _, err := os.Lstat(toAbs); err == nil {
+	if _, err := srcRoot.LstatRaw(toRel); err == nil {
 		return "", ErrAlreadyExists // 不覆盖、不自动重命名（README §13.6）
+	} else if !os.IsNotExist(err) {
+		return "", mapRootFSError(err)
 	}
-	if parentInfo, err := os.Stat(filepath.Dir(toAbs)); err != nil || !parentInfo.IsDir() {
+	toParentRel := relParentDir(toRel)
+	if parentInfo, err := srcRoot.Lstat(toParentRel); err != nil || !parentInfo.IsDir() {
+		if errors.Is(err, security.ErrSymlink) {
+			return "", ErrUnsupported
+		}
 		return "", fmt.Errorf("%w: 目标目录不存在", ErrInvalid)
 	}
 
@@ -1285,9 +1474,22 @@ func (s *Service) move(src *models.StorageSource, fromRel, toRel string, lockTok
 	if err := s.writePathOperation(op); err != nil {
 		return "", fmt.Errorf("记录路径移动意图失败: %w", err)
 	}
-	if err := os.Rename(fromAbs, toAbs); err != nil {
+	if err := srcRoot.Rename(fromRel, toRel); err != nil {
 		_ = s.removePathOperation(op.OperationID)
+		if errors.Is(err, security.ErrSymlink) {
+			return "", ErrUnsupported
+		}
 		return "", fmt.Errorf("移动失败: %w", err)
+	}
+	fromParentRel := relParentDir(fromRel)
+	syncMoveDirs := func() error {
+		if err := srcRoot.SyncDir(fromParentRel); err != nil {
+			return err
+		}
+		if toParentRel != fromParentRel {
+			return srcRoot.SyncDir(toParentRel)
+		}
+		return nil
 	}
 	rollback := func(metadataCommitted bool) error {
 		var rollbackErr error
@@ -1295,17 +1497,17 @@ func (s *Service) move(src *models.StorageSource, fromRel, toRel string, lockTok
 			rollbackErr = s.movePathMetadata(src.ID, toRel, fromRel, info.IsDir(), lockOwnerUserID)
 		}
 		if rollbackErr == nil {
-			rollbackErr = os.Rename(toAbs, fromAbs)
+			rollbackErr = srcRoot.Rename(toRel, fromRel)
 		}
 		if rollbackErr == nil {
-			rollbackErr = syncPathParents(fromAbs, toAbs)
+			rollbackErr = syncMoveDirs()
 		}
 		if rollbackErr == nil {
 			rollbackErr = s.removePathOperation(op.OperationID)
 		}
 		return rollbackErr
 	}
-	if err := syncPathParents(fromAbs, toAbs); err != nil {
+	if err := syncMoveDirs(); err != nil {
 		return "", errors.Join(fmt.Errorf("同步路径移动目录失败: %w", err), rollback(false))
 	}
 	if err := s.markPathFilesystemReady(op.OperationID); err != nil {
@@ -1344,11 +1546,11 @@ func (s *Service) WriteManagedFile(src *models.StorageSource, relInput, scopeDir
 // 所有路径校验先于 mkdir；已存在的临时文件通过 O_EXCL 拒绝，不会被接管或清除。
 // 调用方仍负责托管根所有权、锁、配额以及最终文件与业务台账的提交/回滚。
 func (s *Service) WriteManagedFileWithTemp(src *models.StorageSource, relInput, tempRelInput, scopeDir string, body io.Reader, maxBytes int64, limited bool) (int64, error) {
-	relPath, absPath, err := s.prepareManaged(src, relInput, scopeDir)
+	relPath, _, err := s.prepareManaged(src, relInput, scopeDir)
 	if err != nil {
 		return 0, err
 	}
-	tempRel, tmpPath, err := s.prepareManaged(src, tempRelInput, scopeDir)
+	tempRel, _, err := s.prepareManaged(src, tempRelInput, scopeDir)
 	if err != nil {
 		return 0, err
 	}
@@ -1358,25 +1560,35 @@ func (s *Service) WriteManagedFileWithTemp(src *models.StorageSource, relInput, 
 	if err := s.guardPendingManagedPathWrite(src.ID, relPath, tempRel); err != nil {
 		return 0, err
 	}
-	parentAbs := filepath.Dir(absPath)
-	if err := os.MkdirAll(parentAbs, 0o755); err != nil {
-		return 0, fmt.Errorf("创建托管目录失败: %w", err)
-	}
-	written, _, _, err := writeUploadTempAt(tmpPath, body, maxBytes, limited)
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return 0, err
+	}
+	parentRel := relParentDir(relPath)
+	if err := srcRoot.MkdirAll(parentRel, 0o755); err != nil {
+		if errors.Is(err, security.ErrSymlink) {
+			return 0, ErrUnsupported
+		}
+		return 0, fmt.Errorf("创建托管目录失败: %w", err)
+	}
+	written, _, _, err := writeUploadTempAtRoot(srcRoot, tempRel, body, maxBytes, limited)
+	if err != nil {
+		return 0, mapRootFSError(err)
 	}
 	keepTemp := true
 	defer func() {
 		if keepTemp {
-			_ = os.Remove(tmpPath)
+			_ = srcRoot.Remove(tempRel)
 		}
 	}()
-	if err := os.Rename(tmpPath, absPath); err != nil {
+	if err := srcRoot.Rename(tempRel, relPath); err != nil {
+		if errors.Is(err, security.ErrSymlink) {
+			return 0, ErrUnsupported
+		}
 		return 0, fmt.Errorf("发布托管文件失败: %w", err)
 	}
 	keepTemp = false
-	if err := syncDirectory(parentAbs); err != nil {
+	if err := srcRoot.SyncDir(parentRel); err != nil {
 		return written, fmt.Errorf("同步托管目录失败: %w", err)
 	}
 	return written, nil

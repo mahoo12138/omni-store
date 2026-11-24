@@ -2,7 +2,6 @@ package files
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/security"
 )
 
@@ -91,68 +91,16 @@ func (s *Service) writeTransferOperation(op transferOperation) error {
 		return err
 	}
 	dir := s.transferOperationsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("创建跨来源移动日志目录失败: %w", err)
-	}
-	if _, err := os.Lstat(s.transferOperationPath(op.OperationID)); err == nil {
-		return fmt.Errorf("跨来源移动 %s 尚未恢复", op.OperationID)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
 	for _, marker := range []string{s.transferTargetReadyPath(op.OperationID), s.transferDatabaseReadyPath(op.OperationID)} {
 		if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
-	temp, err := os.CreateTemp(dir, ".operation-*.tmp")
-	if err != nil {
-		return fmt.Errorf("创建跨来源移动日志失败: %w", err)
-	}
-	tempPath := temp.Name()
-	keepTemp := true
-	defer func() {
-		_ = temp.Close()
-		if keepTemp {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := json.NewEncoder(temp).Encode(op); err != nil {
-		return fmt.Errorf("写入跨来源移动日志失败: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("同步跨来源移动日志失败: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("关闭跨来源移动日志失败: %w", err)
-	}
-	if err := os.Link(tempPath, s.transferOperationPath(op.OperationID)); err != nil {
-		return fmt.Errorf("提交跨来源移动日志失败: %w", err)
-	}
-	if err := os.Remove(tempPath); err != nil {
-		return fmt.Errorf("清理跨来源移动临时日志失败: %w", err)
-	}
-	keepTemp = false
-	return syncDirectory(dir)
+	return journal.WriteJSONExclusive(dir, s.transferOperationPath(op.OperationID), op)
 }
 
 func (s *Service) createTransferMarker(path string) error {
-	handle, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := handle.Sync(); err != nil {
-		_ = handle.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := handle.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	return syncDirectory(s.transferOperationsDir())
+	return journal.CreateMarker(path, s.transferOperationsDir())
 }
 
 func (s *Service) markTransferTargetReady(operationID string) error {
@@ -164,16 +112,11 @@ func (s *Service) markTransferDatabaseReady(operationID string) error {
 }
 
 func (s *Service) removeTransferOperation(operationID string) error {
-	for _, path := range []string{
+	return journal.RemoveFiles(s.transferOperationsDir(),
 		s.transferOperationPath(operationID),
 		s.transferTargetReadyPath(operationID),
 		s.transferDatabaseReadyPath(operationID),
-	} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-	}
-	return syncDirectory(s.transferOperationsDir())
+	)
 }
 
 func (s *Service) transferRecoveryPaths(op transferOperation) (sourceAbs, targetAbs string, err error) {
@@ -200,65 +143,16 @@ func (s *Service) transferRecoveryPlan(op transferOperation, sourceAbs, targetAb
 	}
 }
 
-func (s *Service) cleanupTransferRecoveryArtifacts(entries []os.DirEntry) error {
-	dir := s.transferOperationsDir()
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasPrefix(name, ".operation-") && strings.HasSuffix(name, ".tmp") {
-			if err := os.Remove(filepath.Join(dir, name)); err != nil {
-				return fmt.Errorf("清理未提交的跨来源移动临时日志 %s 失败: %w", name, err)
-			}
-			continue
-		}
-		for _, suffix := range []string{".target-ready", ".database-ready"} {
-			if !strings.HasSuffix(name, suffix) {
-				continue
-			}
-			operationID := strings.TrimSuffix(name, suffix)
-			if _, err := os.Stat(s.transferOperationPath(operationID)); errors.Is(err, fs.ErrNotExist) {
-				if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return fmt.Errorf("清理孤立跨来源移动阶段标记 %s 失败: %w", name, err)
-				}
-			} else if err != nil {
-				return fmt.Errorf("检查跨来源移动操作日志 %s 失败: %w", operationID, err)
-			}
-		}
-	}
-	return nil
+func (s *Service) cleanupTransferRecoveryArtifacts(_ []os.DirEntry) error {
+	return journal.CleanOrphans(s.transferOperationsDir(), ".target-ready", ".database-ready")
 }
 
 func decodeTransferOperation(handle io.Reader) (transferOperation, error) {
-	var op transferOperation
-	decoder := json.NewDecoder(handle)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&op); err != nil {
-		return transferOperation{}, err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return transferOperation{}, fmt.Errorf("操作日志包含额外 JSON 值")
-		}
-		return transferOperation{}, err
-	}
-	return op, nil
+	return journal.DecodeStrictJSON[transferOperation](handle)
 }
 
 func transferMarkerExists(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("跨来源移动阶段标记 %s 不是普通文件", filepath.Base(path))
-	}
-	return true, nil
+	return journal.MarkerExists(path)
 }
 
 // SourceTransferOperationCount 返回仍依赖该存储源的中断移动数量。管理员删除

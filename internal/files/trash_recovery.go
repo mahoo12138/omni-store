@@ -2,7 +2,6 @@ package files
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/security"
 )
 
@@ -93,65 +93,20 @@ func (s *Service) writeTrashOperation(op trashOperation) error {
 		return err
 	}
 	dir := s.trashOperationsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("创建回收站操作日志目录失败: %w", err)
-	}
-	if _, err := os.Lstat(s.trashOperationPath(op.TrashKey)); err == nil {
-		return fmt.Errorf("回收站操作 %s 尚未恢复", op.TrashKey)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
 	for _, marker := range []string{s.trashOperationReadyPath(op.TrashKey), s.trashOperationRollbackReadyPath(op.TrashKey)} {
 		if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
-	temp, err := os.CreateTemp(dir, ".operation-*.tmp")
-	if err != nil {
-		return fmt.Errorf("创建回收站操作日志失败: %w", err)
-	}
-	tempPath := temp.Name()
-	keepTemp := true
-	defer func() {
-		_ = temp.Close()
-		if keepTemp {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := json.NewEncoder(temp).Encode(op); err != nil {
-		return fmt.Errorf("写入回收站操作日志失败: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("同步回收站操作日志失败: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("关闭回收站操作日志失败: %w", err)
-	}
-	if err := os.Link(tempPath, s.trashOperationPath(op.TrashKey)); err != nil {
-		return fmt.Errorf("提交回收站操作日志失败: %w", err)
-	}
-	if err := os.Remove(tempPath); err != nil {
-		return fmt.Errorf("清理回收站操作临时日志失败: %w", err)
-	}
-	keepTemp = false
-	return syncDirectory(dir)
+	return journal.WriteJSONExclusive(dir, s.trashOperationPath(op.TrashKey), op)
 }
 
 func (s *Service) removeTrashOperation(trashKey string) error {
-	for _, path := range []string{
+	return journal.RemoveFiles(s.trashOperationsDir(),
 		s.trashOperationPath(trashKey),
 		s.trashOperationReadyPath(trashKey),
 		s.trashOperationRollbackReadyPath(trashKey),
-	} {
-		err := os.Remove(path)
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-	}
-	return syncDirectory(s.trashOperationsDir())
+	)
 }
 
 func (s *Service) markTrashOperationDestinationReady(trashKey string) error {
@@ -163,29 +118,11 @@ func (s *Service) markTrashOperationRollbackReady(trashKey string) error {
 }
 
 func (s *Service) createTrashOperationMarker(readyPath string) error {
-	handle, err := os.OpenFile(readyPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := handle.Sync(); err != nil {
-		_ = handle.Close()
-		_ = os.Remove(readyPath)
-		return err
-	}
-	if err := handle.Close(); err != nil {
-		_ = os.Remove(readyPath)
-		return err
-	}
-	return syncDirectory(s.trashOperationsDir())
+	return journal.CreateMarker(readyPath, s.trashOperationsDir())
 }
 
 func syncDirectory(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return handle.Sync()
+	return journal.SyncDir(dir)
 }
 
 func pathExists(path string) (bool, error) {
@@ -258,12 +195,8 @@ func (s *Service) RecoverTrashOperations() (TrashRecoveryResult, error) {
 			continue
 		}
 		journalPath := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(journalPath)
+		op, err := journal.ReadStrictJSON[trashOperation](journalPath)
 		if err != nil {
-			return result, fmt.Errorf("读取回收站操作日志 %s 失败: %w", entry.Name(), err)
-		}
-		var op trashOperation
-		if err := json.Unmarshal(data, &op); err != nil {
 			return result, fmt.Errorf("解析回收站操作日志 %s 失败: %w", entry.Name(), err)
 		}
 		if err := validateTrashOperation(op); err != nil {

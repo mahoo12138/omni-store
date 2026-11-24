@@ -49,6 +49,8 @@ func (s *Service) reconcileSourceForRecovery(src *models.StorageSource) (*models
 	return s.reconcileSource(src, false)
 }
 
+const reconcileBatchSize = 500
+
 func (s *Service) reconcileSource(src *models.StorageSource, rejectReserved bool) (*models.ReconcileResult, error) {
 	root, err := security.ResolveInSource(src.RootPath, "")
 	if err != nil {
@@ -63,14 +65,11 @@ func (s *Service) reconcileSource(src *models.StorageSource, rejectReserved bool
 		return nil, err
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 	// 普通校准只处理 file scope；托管台账（image_bed 等）由所属服务维护。
+	// 先在只读连接池读取现有快照并计算差异，再按小批次提交写事务，
+	// 避免大源 Reconcile 长时间独占 SQLite 写连接阻塞会话校验和上传。
 	existing := make(map[string]scannedFile)
-	rows, err := tx.Query(`SELECT relative_path, size, mtime_unix_nano FROM file_records
+	rows, err := s.readDB().Query(`SELECT relative_path, size, mtime_unix_nano FROM file_records
   WHERE storage_source_id = ? AND record_status = ? AND resource_scope = ?`,
 		src.ID, models.FileRecordActive, models.FileRecordScopeFile)
 	if err != nil {
@@ -87,24 +86,24 @@ func (s *Service) reconcileSource(src *models.StorageSource, rejectReserved bool
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
-	now := time.Now().UTC()
+	var (
+		toInsert []scannedFile
+		toUpdate []scannedFile
+		toDelete []string
+	)
 	for rel, item := range filesOnDisk {
 		old, found := existing[rel]
 		if !found {
-			if err := insertUnownedFileRecord(tx, src.ID, item, now); err != nil {
-				return nil, err
-			}
-			result.Added++
+			toInsert = append(toInsert, item)
 			continue
 		}
 		delete(existing, rel)
 		if old.size != item.size || old.mtimeNano != item.mtimeNano {
-			if _, err := tx.Exec(`UPDATE file_records SET size = ?, mtime_unix_nano = ?, updated_at = ?
-  WHERE storage_source_id = ? AND relative_path = ?`, item.size, item.mtimeNano, now, src.ID, rel); err != nil {
-				return nil, err
-			}
-			result.Updated++
+			toUpdate = append(toUpdate, item)
 		}
 	}
 	for rel := range existing {
@@ -113,19 +112,70 @@ func (s *Service) reconcileSource(src *models.StorageSource, rejectReserved bool
 			// 不能因本轮未扫描到而被删除；只有所属服务能处理它们。
 			continue
 		}
-		if _, err := tx.Exec(`DELETE FROM file_records WHERE storage_source_id = ? AND relative_path = ?`, src.ID, rel); err != nil {
+		toDelete = append(toDelete, rel)
+	}
+
+	now := time.Now().UTC()
+	for start := 0; start < len(toInsert); start += reconcileBatchSize {
+		end := min(start+reconcileBatchSize, len(toInsert))
+		tx, err := s.db.Begin()
+		if err != nil {
 			return nil, err
 		}
-		result.Removed++
+		for _, item := range toInsert[start:end] {
+			if err := insertUnownedFileRecord(tx, src.ID, item, now); err != nil {
+				_ = tx.Rollback()
+				return nil, err
+			}
+			result.Added++
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
 	}
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM file_records
+	for start := 0; start < len(toUpdate); start += reconcileBatchSize {
+		end := min(start+reconcileBatchSize, len(toUpdate))
+		tx, err := s.db.Begin()
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range toUpdate[start:end] {
+			if _, err := tx.Exec(`UPDATE file_records SET size = ?, mtime_unix_nano = ?, updated_at = ?
+  WHERE storage_source_id = ? AND relative_path = ?`, item.size, item.mtimeNano, now, src.ID, item.rel); err != nil {
+				_ = tx.Rollback()
+				return nil, err
+			}
+			result.Updated++
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+	}
+	for start := 0; start < len(toDelete); start += reconcileBatchSize {
+		end := min(start+reconcileBatchSize, len(toDelete))
+		tx, err := s.db.Begin()
+		if err != nil {
+			return nil, err
+		}
+		for _, rel := range toDelete[start:end] {
+			if _, err := tx.Exec(`DELETE FROM file_records WHERE storage_source_id = ? AND relative_path = ?`, src.ID, rel); err != nil {
+				_ = tx.Rollback()
+				return nil, err
+			}
+			result.Removed++
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.readDB().QueryRow(`SELECT COUNT(*) FROM file_records
   WHERE storage_source_id = ? AND record_status = ? AND owner_type = ?`,
 		src.ID, models.FileRecordActive, models.FileOwnerUnowned).Scan(&result.Unowned); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
+	// 普通校准同时校准物理用量缓存，收敛外部直接写盘偏差。
+	_, _ = s.CalibrateStorageUsage(src)
 	return result, nil
 }
 
@@ -248,17 +298,41 @@ func (s *Service) RecordFile(src *models.StorageSource, relInput, ownerType stri
 	return upsertPreparedFileRecord(s.db, prepared)
 }
 
+// recordUploadedFileWithDelta 在同一 SQLite 事务内提交文件台账与存储源增量物理用量。
+func (s *Service) recordUploadedFileWithDelta(src *models.StorageSource, relInput, ownerType string, ownerUserID, actorUserID *int64, usageDelta int64) error {
+	prepared, err := s.PrepareFileRecord(src, relInput, ownerType, ownerUserID, actorUserID)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertPreparedFileRecord(tx, prepared); err != nil {
+		return err
+	}
+	if err := s.AdjustSourceUsageTx(tx, src.ID, usageDelta); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // PrepareFileRecord 校验最终文件并冻结台账所需的真实大小与 mtime。
 func (s *Service) PrepareFileRecord(src *models.StorageSource, relInput, ownerType string, ownerUserID, actorUserID *int64) (*PreparedFileRecord, error) {
-	relPath, absPath, err := s.prepare(src, relInput)
+	relPath, _, err := s.prepare(src, relInput)
 	if err != nil {
 		return nil, err
 	}
-	info, err := os.Lstat(absPath)
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	info, err := srcRoot.Lstat(relPath)
+	if err != nil {
+		return nil, mapRootFSError(err)
+	}
+	if !info.Mode().IsRegular() {
 		return nil, ErrUnsupported
 	}
 	if ownerType != models.FileOwnerUser && ownerType != models.FileOwnerAnonymous &&
@@ -283,15 +357,19 @@ func (s *Service) PrepareManagedFileRecord(src *models.StorageSource, relInput, 
 	if !ok {
 		return nil, fmt.Errorf("%w: 未登记的托管作用域 %s", ErrInvalid, scopeDir)
 	}
-	relPath, absPath, err := s.prepareManaged(src, relInput, scopeDir)
+	relPath, _, err := s.prepareManaged(src, relInput, scopeDir)
 	if err != nil {
 		return nil, err
 	}
-	info, err := os.Lstat(absPath)
+	srcRoot, err := s.sources.OpenRoot(src)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	info, err := srcRoot.Lstat(relPath)
+	if err != nil {
+		return nil, mapRootFSError(err)
+	}
+	if !info.Mode().IsRegular() {
 		return nil, ErrUnsupported
 	}
 	if ownerType != models.FileOwnerUser && ownerType != models.FileOwnerAnonymous &&
@@ -357,7 +435,7 @@ func (s *Service) deleteFileRecords(storageSourceID int64, relPath string, isDir
 // UserUsage 返回用户拥有的文件总字节数；回收站仍占用户配额，永久清理后才释放。
 func (s *Service) UserUsage(userID int64) (int64, error) {
 	var usage sql.NullInt64
-	err := s.db.QueryRow(`SELECT SUM(size) FROM file_records WHERE owner_user_id = ? AND owner_type = ?`,
+	err := s.readDB().QueryRow(`SELECT SUM(size) FROM file_records WHERE owner_user_id = ? AND owner_type = ?`,
 		userID, models.FileOwnerUser).Scan(&usage)
 	return usage.Int64, err
 }
@@ -385,7 +463,7 @@ func (s *Service) UserQuota(user *models.User) (*models.UserQuota, error) {
 // LedgerSourceUsage 返回台账中的存储源 active 文件总字节数。
 func (s *Service) LedgerSourceUsage(storageSourceID int64) (int64, error) {
 	var usage sql.NullInt64
-	err := s.db.QueryRow(`SELECT SUM(size) FROM file_records WHERE storage_source_id = ? AND record_status = ?`,
+	err := s.readDB().QueryRow(`SELECT SUM(size) FROM file_records WHERE storage_source_id = ? AND record_status = ?`,
 		storageSourceID, models.FileRecordActive).Scan(&usage)
 	return usage.Int64, err
 }
