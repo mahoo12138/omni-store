@@ -8,6 +8,7 @@ import (
 	"github.com/omni-store/omnistore/internal/files"
 	"github.com/omni-store/omnistore/internal/lifecycle"
 	"github.com/omni-store/omnistore/internal/sources"
+	"github.com/omni-store/omnistore/internal/staticassets"
 )
 
 func (s *Server) writeSourceError(w http.ResponseWriter, r *http.Request, err error) {
@@ -140,18 +141,20 @@ func (s *Server) handleAdminUpdateSource(w http.ResponseWriter, r *http.Request)
 		Description     *string   `json:"description"`
 		WebdavEnabled   *bool     `json:"webdav_enabled"`
 		S3Enabled       *bool     `json:"s3_enabled"`
+		StaticEnabled   *bool     `json:"static_enabled"`
 		QuotaBytes      *int64    `json:"quota_bytes"`
 		ExcludePatterns *[]string `json:"exclude_patterns"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	sourceKey := r.PathValue("key")
 	if req.QuotaBytes != nil {
-		releaseQuota := s.files.LockQuotaUpdate(r.PathValue("key"))
+		releaseQuota := s.files.LockQuotaUpdate(sourceKey)
 		defer releaseQuota()
 	}
 
-	src, err := s.sources.Update(r.PathValue("key"), sources.UpdateInput{
+	src, err := s.sources.Update(sourceKey, sources.UpdateInput{
 		Name:            req.Name,
 		Description:     req.Description,
 		WebdavEnabled:   req.WebdavEnabled,
@@ -163,8 +166,65 @@ func (s *Server) handleAdminUpdateSource(w http.ResponseWriter, r *http.Request)
 		s.writeSourceError(w, r, err)
 		return
 	}
+	if req.StaticEnabled != nil && s.staticassets != nil {
+		if err := s.setSourceStaticEnabled(r, sourceKey, *req.StaticEnabled); err != nil {
+			writeStaticConfigError(w, r, err)
+			return
+		}
+		refreshed, getErr := s.sources.Get(sourceKey)
+		if getErr != nil {
+			s.writeSourceError(w, r, getErr)
+			return
+		}
+		src = refreshed
+	}
 	s.adminAudit(r, "update_source", audit.StatusSuccess, "")
 	WriteData(w, r, src)
+}
+
+func (s *Server) setSourceStaticEnabled(r *http.Request, sourceKey string, enabled bool) error {
+	staticCfg, err := s.staticassets.Config(sourceKey)
+	if err != nil {
+		return err
+	}
+	if enabled {
+		if !staticCfg.Configured() {
+			global, gErr := s.staticassets.GlobalSettings()
+			if gErr != nil {
+				return gErr
+			}
+			var actorID *int64
+			if user := CurrentUser(r.Context()); user != nil {
+				actorID = &user.ID
+			}
+			_, err = s.staticassets.Configure(staticassets.ConfigureInput{
+				SourceKey:          sourceKey,
+				PublishRoot:        "",
+				CacheMode:          global.CacheMode,
+				CorsMode:           global.CorsMode,
+				PublicOrigin:       global.PublicOrigin,
+				AllowedOrigins:     global.AllowedOrigins,
+				ConfirmPublishRoot: true,
+			}, actorID, s.audit)
+			return err
+		}
+		if !staticCfg.Enabled {
+			_, err = s.staticassets.Update(staticassets.UpdateInput{
+				SourceKey: sourceKey,
+				Enabled:   &enabled,
+			})
+			return err
+		}
+		return nil
+	}
+	if staticCfg.Configured() && staticCfg.Enabled {
+		_, err = s.staticassets.Update(staticassets.UpdateInput{
+			SourceKey: sourceKey,
+			Enabled:   &enabled,
+		})
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleAdminSetSourceDisabled(disabled bool) http.HandlerFunc {
@@ -215,17 +275,17 @@ func (s *Server) handleAdminDeleteSource(w http.ResponseWriter, r *http.Request)
 		WriteError(w, r, CodeConflict, "存储源仍被 Site Capability 绑定，请先解除绑定", map[string]any{"bound_capabilities": bound})
 		return
 	}
-	// 公开身份必须先显式撤销，防止删除源时悄悄破坏静态链接。
+	// 公开身份在启用期间禁止删除源，防止悄悄破坏静态链接；已关闭的配置随源一并清理。
 	staticConfig, err := s.staticassets.Config(src.Key)
 	if err != nil {
 		WriteError(w, r, CodeInternalError, "检查静态 HTTP 配置失败", nil)
 		return
 	}
-	if staticConfig.Configured() {
-		WriteError(w, r, CodeConflict, "存储源仍有静态 HTTP 配置，请先关闭并移除配置", nil)
+	if staticConfig.Enabled {
+		WriteError(w, r, CodeConflict, "存储源已启用静态 HTTP，请先关闭后再删除", nil)
 		return
 	}
-	releaseLifecycle := lifecycle.Write(lifecycle.Source(src.ID))
+	releaseLifecycle := s.lifecycleManager().Write(lifecycle.Source(src.ID))
 	defer releaseLifecycle()
 	trashCount, err := s.files.SourceTrashCount(src.ID)
 	if err != nil {
@@ -300,6 +360,12 @@ func (s *Server) handleAdminDeleteSource(w http.ResponseWriter, r *http.Request)
 		}
 		if uploadCount > 0 {
 			WriteError(w, r, CodeConflict, "存储源存在尚未恢复的图床上传，请重启服务完成恢复", map[string]any{"upload_count": uploadCount})
+			return
+		}
+	}
+	if staticConfig.Configured() && !staticConfig.Enabled {
+		if err := s.staticassets.Remove(src.Key, staticConfig.Revision); err != nil {
+			writeStaticConfigError(w, r, err)
 			return
 		}
 	}

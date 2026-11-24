@@ -132,173 +132,8 @@ func (s *Server) fileAudit(r *http.Request, action string, src *models.StorageSo
 // recordRecentFile is independent of audit retention/configuration and never turns
 // a completed file operation into a failure if the recent-file index is unavailable.
 func (s *Server) recordRecentFile(userID int64, src *models.StorageSource, relPath string) {
-	normalized, err := security.NormalizeRelPath(relPath)
-	if err != nil || normalized == "" {
-		return
-	}
-	_, err = s.db.Exec(`INSERT INTO recent_files (user_id, storage_source_id, relative_path, accessed_at)
-  VALUES (?, ?, ?, ?)
-  ON CONFLICT(user_id, storage_source_id, relative_path) DO UPDATE SET accessed_at = excluded.accessed_at`,
-		userID, src.ID, normalized, time.Now().UTC())
-	if err != nil {
-		s.logger.Warn("记录最近文件失败", "source", src.Key, "path", normalized, "err", err)
-		return
-	}
-	if _, err := s.db.Exec(`DELETE FROM recent_files WHERE user_id = ? AND id NOT IN (
-  SELECT id FROM recent_files WHERE user_id = ? ORDER BY accessed_at DESC, id DESC LIMIT 500
-)`, userID, userID); err != nil {
-		s.logger.Warn("清理最近文件记录失败", "user_id", userID, "err", err)
-	}
-}
-
-// rebaseRecentFiles preserves a user's recent child files when a containing
-// directory is renamed, moved, or restored to a different path.
-func (s *Server) rebaseRecentFiles(userID int64, sourceID int64, oldPath string, targetSourceID int64, newPath string) {
-	oldPath, err := security.NormalizeRelPath(oldPath)
-	if err != nil || oldPath == "" {
-		return
-	}
-	newPath, err = security.NormalizeRelPath(newPath)
-	if err != nil || newPath == "" {
-		return
-	}
-	rows, err := s.db.Query(`SELECT id, relative_path FROM recent_files WHERE user_id = ? AND storage_source_id = ?`, userID, sourceID)
-	if err != nil {
-		s.logger.Warn("读取最近文件目录记录失败", "user_id", userID, "err", err)
-		return
-	}
-	type recentPath struct {
-		id   int64
-		path string
-	}
-	items := make([]recentPath, 0)
-	for rows.Next() {
-		var item recentPath
-		if err := rows.Scan(&item.id, &item.path); err != nil {
-			_ = rows.Close()
-			s.logger.Warn("读取最近文件目录记录失败", "user_id", userID, "err", err)
-			return
-		}
-		if item.path == oldPath || strings.HasPrefix(item.path, oldPath+"/") {
-			items = append(items, item)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		s.logger.Warn("读取最近文件目录记录失败", "user_id", userID, "err", err)
-		return
-	}
-	if err := rows.Close(); err != nil {
-		s.logger.Warn("读取最近文件目录记录失败", "user_id", userID, "err", err)
-		return
-	}
-	if len(items) == 0 {
-		return
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		s.logger.Warn("更新最近文件目录记录失败", "user_id", userID, "err", err)
-		return
-	}
-	defer tx.Rollback()
-	accessedAt := time.Now().UTC()
-	for _, item := range items {
-		targetPath := newPath + strings.TrimPrefix(item.path, oldPath)
-		if targetSourceID == sourceID && targetPath == item.path {
-			continue
-		}
-		if _, err := tx.Exec(`INSERT INTO recent_files (user_id, storage_source_id, relative_path, accessed_at)
-  VALUES (?, ?, ?, ?)
-  ON CONFLICT(user_id, storage_source_id, relative_path) DO UPDATE SET accessed_at =
-    CASE WHEN recent_files.accessed_at < excluded.accessed_at THEN excluded.accessed_at ELSE recent_files.accessed_at END`,
-			userID, targetSourceID, targetPath, accessedAt); err != nil {
-			s.logger.Warn("更新最近文件目录记录失败", "user_id", userID, "path", targetPath, "err", err)
-			return
-		}
-		if _, err := tx.Exec(`DELETE FROM recent_files WHERE id = ?`, item.id); err != nil {
-			s.logger.Warn("更新最近文件目录记录失败", "user_id", userID, "path", item.path, "err", err)
-			return
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		s.logger.Warn("更新最近文件目录记录失败", "user_id", userID, "err", err)
-	}
-}
-
-// rebaseFavoritePaths keeps bookmarks attached to a moved or renamed path for
-// every user who could previously favorite it.
-func (s *Server) rebaseFavoritePaths(sourceID int64, oldPath string, targetSourceID int64, newPath string) {
-	oldPath, err := security.NormalizeRelPath(oldPath)
-	if err != nil || oldPath == "" {
-		return
-	}
-	newPath, err = security.NormalizeRelPath(newPath)
-	if err != nil || newPath == "" {
-		return
-	}
-	rows, err := s.db.Query(`SELECT id, user_id, relative_path, created_at FROM favorites
-  WHERE storage_source_id = ? AND (relative_path = ? OR substr(relative_path, 1, length(?) + 1) = ? || '/')`,
-		sourceID, oldPath, oldPath, oldPath)
-	if err != nil {
-		s.logger.Warn("读取收藏路径失败", "source_id", sourceID, "err", err)
-		return
-	}
-	type favoritePath struct {
-		id        int64
-		userID    int64
-		path      string
-		createdAt string
-	}
-	items := make([]favoritePath, 0)
-	for rows.Next() {
-		var item favoritePath
-		if err := rows.Scan(&item.id, &item.userID, &item.path, &item.createdAt); err != nil {
-			_ = rows.Close()
-			s.logger.Warn("读取收藏路径失败", "source_id", sourceID, "err", err)
-			return
-		}
-		if item.path == oldPath || strings.HasPrefix(item.path, oldPath+"/") {
-			items = append(items, item)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		s.logger.Warn("读取收藏路径失败", "source_id", sourceID, "err", err)
-		return
-	}
-	if err := rows.Close(); err != nil {
-		s.logger.Warn("读取收藏路径失败", "source_id", sourceID, "err", err)
-		return
-	}
-	if len(items) == 0 {
-		return
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		s.logger.Warn("更新收藏路径失败", "source_id", sourceID, "err", err)
-		return
-	}
-	defer tx.Rollback()
-	for _, item := range items {
-		targetPath := newPath + strings.TrimPrefix(item.path, oldPath)
-		if targetSourceID == sourceID && targetPath == item.path {
-			continue
-		}
-		if _, err := tx.Exec(`INSERT INTO favorites (user_id, storage_source_id, relative_path, created_at)
-  VALUES (?, ?, ?, ?)
-  ON CONFLICT(user_id, storage_source_id, relative_path) DO UPDATE SET created_at =
-    CASE WHEN favorites.created_at > excluded.created_at THEN excluded.created_at ELSE favorites.created_at END`,
-			item.userID, targetSourceID, targetPath, item.createdAt); err != nil {
-			s.logger.Warn("更新收藏路径失败", "path", targetPath, "err", err)
-			return
-		}
-		if _, err := tx.Exec(`DELETE FROM favorites WHERE id = ?`, item.id); err != nil {
-			s.logger.Warn("更新收藏路径失败", "path", item.path, "err", err)
-			return
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		s.logger.Warn("更新收藏路径失败", "source_id", sourceID, "err", err)
+	if err := s.files.RecordRecentFile(userID, src.ID, relPath); err != nil {
+		s.logger.Warn("记录最近文件失败", "source", src.Key, "path", relPath, "err", err)
 	}
 }
 
@@ -360,7 +195,7 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeSourcePath(w, r, src, relPath, false, false) {
 		return
 	}
-	f, info, unlock, err := s.files.OpenForRead(src, relPath)
+	f, info, unlock, err := s.files.OpenForReadContext(r.Context(), src, relPath)
 	if err != nil {
 		writeFileError(w, r, err)
 		return
@@ -373,7 +208,7 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	filename := sanitizeFilename(path.Base("/" + relPath))
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 	w.Header().Set("Cache-Control", "private, no-store")
-	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+	serveContentWithDeadline(w, r, info.Name(), info.ModTime(), f)
 }
 
 // handleRawFile 内联返回文件内容，供文件管理器与分享页共用的预览渲染器使用（1.2.0）。
@@ -388,7 +223,7 @@ func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeSourcePath(w, r, src, relPath, false, false) {
 		return
 	}
-	f, info, unlock, err := s.files.OpenForRead(src, relPath)
+	f, info, unlock, err := s.files.OpenForReadContext(r.Context(), src, relPath)
 	if err != nil {
 		writeFileError(w, r, err)
 		return
@@ -405,7 +240,7 @@ func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 	if download {
 		s.recordRecentFile(CurrentUser(r.Context()).ID, src, relPath)
 	}
-	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+	serveContentWithDeadline(w, r, info.Name(), info.ModTime(), f)
 }
 
 func (s *Server) handleDownloadArchive(w http.ResponseWriter, r *http.Request) {
@@ -443,10 +278,16 @@ func (s *Server) handleDownloadArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	user := CurrentUser(r.Context())
+	recentPaths := make([]string, 0, len(req.Paths))
 	for _, relPath := range req.Paths {
 		entry, statErr := s.files.Stat(src, relPath)
 		if statErr == nil && entry.Type == files.TypeFile {
-			s.recordRecentFile(user.ID, src, relPath)
+			recentPaths = append(recentPaths, relPath)
+		}
+	}
+	if len(recentPaths) > 0 {
+		if err := s.files.RecordRecentFilesBatch(user.ID, src.ID, recentPaths); err != nil {
+			s.logger.Warn("批量记录最近文件失败", "source", src.Key, "count", len(recentPaths), "err", err)
 		}
 	}
 
@@ -455,7 +296,7 @@ func (s *Server) handleDownloadArchive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.FormatInt(pkg.Size, 10))
 	w.Header().Set("Cache-Control", "private, no-store")
 	s.fileAudit(r, "batch_download", src, strings.Join(req.Paths, ","), "", nil)
-	http.ServeContent(w, r, pkg.Filename, time.Time{}, file)
+	serveContentWithDeadline(w, r, pkg.Filename, time.Time{}, file)
 }
 
 // --- 写操作 ---
@@ -497,6 +338,9 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 
 	maxBytes := s.cfg.Upload.MaxFileSizeMB*1024*1024 + 1024*1024 // multipart 元数据余量
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	defer func() {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	}()
 
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -512,11 +356,24 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	for {
 		part, err := mr.NextPart()
 		if err != nil {
-			WriteError(w, r, CodeValidationError, "缺少 file 字段", nil)
+			var maxBytesErr *http.MaxBytesError
+			switch {
+			case errors.As(err, &maxBytesErr):
+				WriteError(w, r, CodePayloadTooLarge, "文件超过上传大小限制", nil)
+			case errors.Is(err, io.EOF):
+				WriteError(w, r, CodeValidationError, "缺少 file 字段", nil)
+			default:
+				WriteError(w, r, CodeValidationError, "解析上传表单失败", nil)
+			}
 			return
 		}
 		if part.FormName() == "relative_path" {
 			value, readErr := io.ReadAll(io.LimitReader(part, 4097))
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(readErr, &maxBytesErr) {
+				WriteError(w, r, CodePayloadTooLarge, "文件超过上传大小限制", nil)
+				return
+			}
 			if readErr != nil || len(value) > 4096 {
 				WriteError(w, r, CodeValidationError, "relative_path 无效", nil)
 				return
@@ -556,21 +413,28 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 			writeFileError(w, r, fmt.Errorf("%w: relative_path 不能为空", files.ErrInvalid))
 			return
 		}
+		var createdParents []string
 		if hasRelativePath {
 			if !s.authorizeUploadPath(w, r, src, target) {
 				return
 			}
-			if err := s.files.EnsureObjectParents(src, target); err != nil {
-				s.fileAudit(r, "upload", src, target, "", err)
-				writeFileError(w, r, err)
+			var parentErr error
+			createdParents, parentErr = s.files.EnsureObjectParentsCreated(src, target)
+			if parentErr != nil {
+				s.fileAudit(r, "upload", src, target, "", parentErr)
+				writeFileError(w, r, parentErr)
 				return
 			}
 		} else if !s.authorizeSourcePath(w, r, src, target, true, false) {
 			return
 		}
 		user := CurrentUser(r.Context())
-		relPath, size, err := s.files.UploadWithLockTokens(src, dirRel, filename, part, overwrite, nil, &user.ID)
+		body := newRollingReadDeadline(w, part)
+		relPath, size, err := s.files.UploadWithLockTokens(src, dirRel, filename, body, overwrite, nil, &user.ID)
 		if err != nil {
+			if len(createdParents) > 0 {
+				s.files.CleanupEmptyDirs(src, createdParents)
+			}
 			s.fileAudit(r, "upload", src, target, "", err)
 			writeFileError(w, r, err)
 			return
@@ -690,10 +554,7 @@ func (s *Server) handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
 	s.fileAudit(r, "restore", src, entry.OriginalRelativePath, restored.OriginalRelativePath, nil)
 	if entry.EntryType == string(files.TypeFile) {
 		s.recordRecentFile(user.ID, src, restored.OriginalRelativePath)
-	} else if entry.EntryType == string(files.TypeDir) {
-		s.rebaseRecentFiles(user.ID, src.ID, entry.OriginalRelativePath, src.ID, restored.OriginalRelativePath)
 	}
-	s.rebaseFavoritePaths(src.ID, entry.OriginalRelativePath, src.ID, restored.OriginalRelativePath)
 	WriteData(w, r, restored)
 }
 
@@ -763,11 +624,6 @@ func (s *Server) handleRenameFile(w http.ResponseWriter, r *http.Request) {
 	s.fileAudit(r, "rename", src, strings.TrimPrefix(req.Path, "/"), newRel, nil)
 	if oldStatErr == nil && oldEntry.Type == files.TypeFile {
 		s.recordRecentFile(user.ID, src, newRel)
-	} else if oldStatErr == nil && oldEntry.Type == files.TypeDir {
-		s.rebaseRecentFiles(user.ID, src.ID, req.Path, src.ID, newRel)
-	}
-	if oldStatErr == nil {
-		s.rebaseFavoritePaths(src.ID, req.Path, src.ID, newRel)
 	}
 	WriteData(w, r, map[string]any{"path": "/" + newRel})
 }
@@ -806,11 +662,6 @@ func (s *Server) handleMoveFile(w http.ResponseWriter, r *http.Request) {
 	s.fileAudit(r, "move", src, strings.TrimPrefix(req.Path, "/"), result.Path, nil)
 	if oldStatErr == nil && oldEntry.Type == files.TypeFile {
 		s.recordRecentFile(user.ID, target, result.Path)
-	} else if oldStatErr == nil && oldEntry.Type == files.TypeDir {
-		s.rebaseRecentFiles(user.ID, src.ID, req.Path, target.ID, result.Path)
-	}
-	if oldStatErr == nil {
-		s.rebaseFavoritePaths(src.ID, req.Path, target.ID, result.Path)
 	}
 	result.Path = "/" + result.Path
 	WriteData(w, r, result)

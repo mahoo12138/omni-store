@@ -1,7 +1,6 @@
 package httpserver
 
 import (
-	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
@@ -165,7 +164,7 @@ func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, CodeValidationError, "不能删除自己的账号", nil)
 		return
 	}
-	releaseLifecycle := lifecycle.Write(lifecycle.User(id))
+	releaseLifecycle := s.lifecycleManager().Write(lifecycle.User(id))
 	defer releaseLifecycle()
 	trashCount, err := s.files.UserTrashCount(id)
 	if err != nil {
@@ -305,40 +304,21 @@ func (s *Server) handleMyActivity(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rows, err := s.db.Query(`SELECT a.id, a.action, a.relative_path, a.created_at,
-       COALESCE(s.name, '') AS source_name
-  FROM audit_logs a
-	  LEFT JOIN storage_sources s ON s.id = a.storage_source_id
-  WHERE a.actor_type = 'user' AND a.actor_user_id = ?
-    AND a.action NOT IN ('login_success', 'login_failed', 'change_password')
-  ORDER BY a.id DESC LIMIT ?`, u.ID, limit)
+	entries, err := s.audit.UserActivity(u.ID, limit)
 	if err != nil {
 		WriteError(w, r, CodeInternalError, "查询活动失败", nil)
 		return
 	}
-	defer rows.Close()
-
-	out := []ActivityItem{}
-	for rows.Next() {
-		var (
-			it           ActivityItem
-			relativePath *string
-			createdAt    string
-		)
-		if err := rows.Scan(&it.ID, &it.Action, &relativePath, &createdAt, &it.SourceName); err != nil {
-			WriteError(w, r, CodeInternalError, "查询活动失败", nil)
-			return
-		}
-		if relativePath != nil {
-			it.RelativePath = *relativePath
-		}
-		it.CreatedAt = createdAt
-		it.Title = humanizeActivity(it.Action, it.RelativePath, it.SourceName)
-		out = append(out, it)
-	}
-	if err := rows.Err(); err != nil {
-		WriteError(w, r, CodeInternalError, "查询活动失败", nil)
-		return
+	out := make([]ActivityItem, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, ActivityItem{
+			ID:           entry.ID,
+			Action:       entry.Action,
+			Title:        humanizeActivity(entry.Action, entry.RelativePath, entry.SourceName),
+			SourceName:   entry.SourceName,
+			RelativePath: entry.RelativePath,
+			CreatedAt:    entry.CreatedAt,
+		})
 	}
 	WriteData(w, r, ListData{Items: out, Total: int64(len(out))})
 }
@@ -364,48 +344,19 @@ func (s *Server) handleMyRecentFiles(w http.ResponseWriter, r *http.Request) {
 			limit = parsed
 		}
 	}
-	rows, err := s.db.Query(`SELECT rf.id, rf.storage_source_id, s.key, s.name, rf.relative_path, rf.accessed_at
-  FROM recent_files rf JOIN storage_sources s ON s.id = rf.storage_source_id
-  WHERE rf.user_id = ? ORDER BY rf.accessed_at DESC, rf.id DESC LIMIT 500`, user.ID)
+	candidates, err := s.files.ListRecentFiles(user.ID)
 	if err != nil {
-		WriteError(w, r, CodeInternalError, "查询最近文件失败", nil)
-		return
-	}
-	type candidate struct {
-		id           int64
-		sourceID     int64
-		sourceKey    string
-		sourceName   string
-		relativePath string
-		accessedAt   string
-	}
-	candidates := make([]candidate, 0, 100)
-	for rows.Next() {
-		var item candidate
-		if err := rows.Scan(&item.id, &item.sourceID, &item.sourceKey, &item.sourceName, &item.relativePath, &item.accessedAt); err != nil {
-			rows.Close()
-			WriteError(w, r, CodeInternalError, "查询最近文件失败", nil)
-			return
-		}
-		candidates = append(candidates, item)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		WriteError(w, r, CodeInternalError, "查询最近文件失败", nil)
-		return
-	}
-	if err := rows.Close(); err != nil {
 		WriteError(w, r, CodeInternalError, "查询最近文件失败", nil)
 		return
 	}
 
 	items := make([]RecentFileItem, 0, limit)
 	for _, candidate := range candidates {
-		source, err := s.sources.GetByID(candidate.sourceID)
+		source, err := s.sources.GetByID(candidate.SourceID)
 		if err != nil || source.IsDisabled {
 			continue
 		}
-		allowed, err := s.sources.CanReadPath(user, candidate.sourceKey, candidate.relativePath)
+		allowed, err := s.sources.CanReadPath(user, candidate.SourceKey, candidate.RelativePath)
 		if err != nil {
 			WriteError(w, r, CodeInternalError, "检查最近文件权限失败", nil)
 			return
@@ -413,14 +364,14 @@ func (s *Server) handleMyRecentFiles(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			continue
 		}
-		entry, err := s.files.Stat(source, candidate.relativePath)
+		entry, err := s.files.Stat(source, candidate.RelativePath)
 		if err != nil || entry.Type != files.TypeFile {
 			continue
 		}
 		items = append(items, RecentFileItem{
-			ID: candidate.id, SourceKey: candidate.sourceKey, SourceName: candidate.sourceName,
-			Path: candidate.relativePath, Name: entry.Name, Size: entry.Size,
-			ModifiedAt: entry.MTime, AccessedAt: candidate.accessedAt,
+			ID: candidate.ID, SourceKey: candidate.SourceKey, SourceName: candidate.SourceName,
+			Path: candidate.RelativePath, Name: entry.Name, Size: entry.Size,
+			ModifiedAt: entry.MTime, AccessedAt: candidate.AccessedAt,
 		})
 		if len(items) == limit {
 			break
@@ -444,48 +395,19 @@ type FavoriteItem struct {
 // handleMyFavorites shows only targets that still exist and are currently readable.
 func (s *Server) handleMyFavorites(w http.ResponseWriter, r *http.Request) {
 	user := CurrentUser(r.Context())
-	rows, err := s.db.Query(`SELECT f.id, f.storage_source_id, s.key, s.name, f.relative_path, f.created_at
-  FROM favorites f JOIN storage_sources s ON s.id = f.storage_source_id
-  WHERE f.user_id = ? ORDER BY f.created_at DESC, f.id DESC LIMIT 500`, user.ID)
+	candidates, err := s.files.ListFavorites(user.ID)
 	if err != nil {
-		WriteError(w, r, CodeInternalError, "查询收藏失败", nil)
-		return
-	}
-	type candidate struct {
-		id           int64
-		sourceID     int64
-		sourceKey    string
-		sourceName   string
-		relativePath string
-		createdAt    string
-	}
-	candidates := make([]candidate, 0)
-	for rows.Next() {
-		var item candidate
-		if err := rows.Scan(&item.id, &item.sourceID, &item.sourceKey, &item.sourceName, &item.relativePath, &item.createdAt); err != nil {
-			_ = rows.Close()
-			WriteError(w, r, CodeInternalError, "查询收藏失败", nil)
-			return
-		}
-		candidates = append(candidates, item)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		WriteError(w, r, CodeInternalError, "查询收藏失败", nil)
-		return
-	}
-	if err := rows.Close(); err != nil {
 		WriteError(w, r, CodeInternalError, "查询收藏失败", nil)
 		return
 	}
 
 	items := make([]FavoriteItem, 0, len(candidates))
 	for _, candidate := range candidates {
-		source, err := s.sources.GetByID(candidate.sourceID)
+		source, err := s.sources.GetByID(candidate.SourceID)
 		if err != nil || source.IsDisabled {
 			continue
 		}
-		allowed, err := s.sources.CanReadPath(user, candidate.sourceKey, candidate.relativePath)
+		allowed, err := s.sources.CanReadPath(user, candidate.SourceKey, candidate.RelativePath)
 		if err != nil {
 			WriteError(w, r, CodeInternalError, "检查收藏权限失败", nil)
 			return
@@ -493,20 +415,20 @@ func (s *Server) handleMyFavorites(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			continue
 		}
-		entry, err := s.files.Stat(source, candidate.relativePath)
+		entry, err := s.files.Stat(source, candidate.RelativePath)
 		if errors.Is(err, files.ErrNotFound) {
 			// Remove dead path references so a later file created at the same path
 			// does not unexpectedly inherit an old favorite.
-			_, _ = s.db.Exec(`DELETE FROM favorites WHERE id = ? AND user_id = ?`, candidate.id, user.ID)
+			_, _ = s.files.DeleteFavorite(user.ID, candidate.ID)
 			continue
 		}
 		if err != nil || (entry.Type != files.TypeFile && entry.Type != files.TypeDir) {
 			continue
 		}
 		items = append(items, FavoriteItem{
-			ID: candidate.id, SourceKey: candidate.sourceKey, SourceName: candidate.sourceName,
-			Path: candidate.relativePath, Name: entry.Name, Type: string(entry.Type),
-			Size: entry.Size, ModifiedAt: entry.MTime, CreatedAt: candidate.createdAt,
+			ID: candidate.ID, SourceKey: candidate.SourceKey, SourceName: candidate.SourceName,
+			Path: candidate.RelativePath, Name: entry.Name, Type: string(entry.Type),
+			Size: entry.Size, ModifiedAt: entry.MTime, CreatedAt: candidate.CreatedAt,
 		})
 	}
 	WriteData(w, r, ListData{Items: items, Total: int64(len(items))})
@@ -542,39 +464,12 @@ func (s *Server) handleAddFavorite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := CurrentUser(r.Context())
-	tx, err := s.db.Begin()
+	id, err := s.files.AddFavorite(user.ID, source.ID, relativePath)
 	if err != nil {
-		WriteError(w, r, CodeInternalError, "添加收藏失败", nil)
-		return
-	}
-	defer tx.Rollback()
-	var id int64
-	err = tx.QueryRow(`SELECT id FROM favorites WHERE user_id = ? AND storage_source_id = ? AND relative_path = ?`, user.ID, source.ID, relativePath).Scan(&id)
-	if err != nil && err != sql.ErrNoRows {
-		WriteError(w, r, CodeInternalError, "读取收藏失败", nil)
-		return
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		var count int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM favorites WHERE user_id = ?`, user.ID).Scan(&count); err != nil {
-			WriteError(w, r, CodeInternalError, "统计收藏数量失败", nil)
+		if errors.Is(err, files.ErrFavoriteLimit) {
+			WriteError(w, r, CodeValidationError, err.Error(), nil)
 			return
 		}
-		if count >= 500 {
-			WriteError(w, r, CodeValidationError, "收藏数量已达上限（500 项）", nil)
-			return
-		}
-		if _, err := tx.Exec(`INSERT INTO favorites (user_id, storage_source_id, relative_path, created_at)
-  VALUES (?, ?, ?, ?)`, user.ID, source.ID, relativePath, time.Now().UTC()); err != nil {
-			WriteError(w, r, CodeInternalError, "添加收藏失败", nil)
-			return
-		}
-		if err := tx.QueryRow(`SELECT id FROM favorites WHERE user_id = ? AND storage_source_id = ? AND relative_path = ?`, user.ID, source.ID, relativePath).Scan(&id); err != nil {
-			WriteError(w, r, CodeInternalError, "读取收藏失败", nil)
-			return
-		}
-	}
-	if err := tx.Commit(); err != nil {
 		WriteError(w, r, CodeInternalError, "添加收藏失败", nil)
 		return
 	}
@@ -591,17 +486,12 @@ func (s *Server) handleDeleteFavorite(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, CodeValidationError, "收藏标识无效", nil)
 		return
 	}
-	result, err := s.db.Exec(`DELETE FROM favorites WHERE id = ? AND user_id = ?`, id, CurrentUser(r.Context()).ID)
+	deleted, err := s.files.DeleteFavorite(CurrentUser(r.Context()).ID, id)
 	if err != nil {
 		WriteError(w, r, CodeInternalError, "移除收藏失败", nil)
 		return
 	}
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		WriteError(w, r, CodeInternalError, "移除收藏失败", nil)
-		return
-	}
-	if deleted == 0 {
+	if !deleted {
 		WriteError(w, r, CodeFileNotFound, "收藏不存在", nil)
 		return
 	}

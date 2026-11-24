@@ -46,6 +46,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			WriteError(w, r, CodePayloadTooLarge, "请求体超过大小限制", nil)
+			return false
+		}
 		WriteError(w, r, CodeValidationError, "请求体格式错误", nil)
 		return false
 	}

@@ -52,7 +52,7 @@ func (s *Server) handlePublicRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, info, unlock, err := s.public.Files().OpenForRead(src, inner)
+	f, info, unlock, err := s.public.Files().OpenForReadContext(r.Context(), src, inner)
 	if err != nil {
 		// 公开侧不区分错误类型，统一 404，避免泄露内部信息。
 		http.NotFound(w, r)
@@ -67,5 +67,5 @@ func (s *Server) handlePublicRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+	serveContentWithDeadline(w, r, info.Name(), info.ModTime(), f)
 }

@@ -1,7 +1,6 @@
 package httpserver
 
 import (
-	"context"
 	"database/sql"
 	"io/fs"
 	"log/slog"
@@ -19,6 +18,7 @@ import (
 	"github.com/omni-store/omnistore/internal/config"
 	"github.com/omni-store/omnistore/internal/files"
 	"github.com/omni-store/omnistore/internal/imagebed"
+	"github.com/omni-store/omnistore/internal/lifecycle"
 	"github.com/omni-store/omnistore/internal/locks"
 	"github.com/omni-store/omnistore/internal/oidc"
 	"github.com/omni-store/omnistore/internal/operations"
@@ -32,6 +32,33 @@ import (
 	"github.com/omni-store/omnistore/internal/webdav"
 	"github.com/omni-store/omnistore/web"
 )
+
+// Deps 汇总 HTTP 路由层所需的全部已装配领域服务，由 internal/app 构造并注入。
+type Deps struct {
+	Config         *config.Config
+	DB             *sql.DB
+	Logger         *slog.Logger
+	Users          *users.Service
+	Sources        *sources.Service
+	Files          *files.Service
+	Public         *publicdisk.Service
+	Shares         *shares.Service
+	Sessions       *auth.Sessions
+	LoginLimiter   *auth.LoginLimiter
+	Tokens         *auth.Tokens
+	ImageBed       *imagebed.Service
+	AnonLimiter    *imagebed.RateLimiter
+	Capabilities   *capabilities.Service
+	StaticAssets   *staticassets.Service
+	Operations     *operations.Service
+	Audit          *audit.Logger
+	Proxy          *security.ProxyResolver
+	OIDCSettings   *oidc.Settings
+	S3Keys         *s3api.Credentials
+	S3Multipart    *s3api.MultipartStore
+	Lifecycle      *lifecycle.Manager
+	BootstrapToken string
+}
 
 // Server 聚合 HTTP 层依赖。
 type Server struct {
@@ -60,62 +87,112 @@ type Server struct {
 	s3Keys          *s3api.Credentials
 	s3Multipart     *s3api.MultipartStore
 	s3Handler       http.Handler
+	lifecycle       *lifecycle.Manager
 	bootstrapToken  string
 }
 
-// New 创建 HTTP Server，同时返回内部 Server 以便 main 启动后台任务。
+func (s *Server) lifecycleManager() *lifecycle.Manager {
+	if s.lifecycle != nil {
+		return s.lifecycle
+	}
+	return lifecycle.Default()
+}
+
+// New 便捷构造 HTTP Server（主要用于集成测试）；生产启动请通过 internal/app.New 装配。
 func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server, *Server) {
-	bootstrapToken := strings.TrimSpace(cfg.Security.BootstrapToken)
-	if bootstrapToken == "" {
-		bootstrapToken = auth.NewRandomToken("setup-", 24)
+	life := lifecycle.NewManager()
+	srcSvc := sources.NewService(dbConn, cfg.Data.Dir)
+	fileSvc := files.NewService(dbConn, srcSvc, locks.NewManager())
+	fileSvc.SetLifecycle(life)
+	capSvc := capabilities.NewService(dbConn, srcSvc)
+	staticSvc := staticassets.NewService(dbConn, srcSvc, fileSvc, cfg.Server.PublicURL)
+	pubSvc := publicdisk.NewService(fileSvc, capSvc)
+	shareSvc := shares.NewService(dbConn, srcSvc, fileSvc, cfg.Server.PublicURL)
+	sessSvc := auth.NewSessions(dbConn, time.Duration(cfg.Security.SessionTTLHours)*time.Hour)
+	tokenSvc := auth.NewTokens(dbConn)
+	s3Keys := s3api.NewCredentials(dbConn, cfg.Data.Dir, cfg.Security.MasterKey)
+	s3MP := s3api.NewMultipartStore(dbConn, cfg.Data.Dir, fileSvc, cfg.Upload.MaxFileSizeMB)
+	s3MP.SetLifecycle(life)
+	ibSvc, err := imagebed.NewService(dbConn, cfg.Server.PublicURL,
+		filepath.Join(cfg.Data.Dir, "cache", "thumbnails"), srcSvc, capSvc, fileSvc)
+	if err != nil {
+		panic(err)
 	}
-	s := &Server{
-		cfg:            cfg,
-		db:             dbConn,
-		logger:         logger,
-		users:          users.NewService(dbConn),
-		sessions:       auth.NewSessions(dbConn, time.Duration(cfg.Security.SessionTTLHours)*time.Hour),
-		audit:          audit.New(dbConn, cfg.Audit.Enabled, cfg.Audit.MaxEntries, logger),
-		proxy:          security.NewProxyResolver(cfg.Server.TrustedProxies),
-		bootstrapToken: bootstrapToken,
-	}
+	ibSvc.SetLifecycle(life)
+	opsSvc := operations.NewService(dbConn, cfg.DatabasePath(), cfg.Data.Dir, buildinfo.Version,
+		srcSvc, fileSvc, ibSvc, sessSvc, MultipartCleanupAdapter(s3MP))
 	loginLimit := cfg.Security.LoginRateLimit
 	if !loginLimit.Enabled {
 		loginLimit.MaxFailuresPerIP = 0
 		loginLimit.MaxFailuresPerUsername = 0
 	}
-	s.loginLimiter = auth.NewLoginLimiter(
-		time.Duration(loginLimit.WindowMinutes)*time.Minute,
-		loginLimit.MaxFailuresPerIP,
-		loginLimit.MaxFailuresPerUsername,
-	)
+	return NewWithDeps(Deps{
+		Config:       cfg,
+		DB:           dbConn,
+		Logger:       logger,
+		Users:        users.NewService(dbConn),
+		Sources:      srcSvc,
+		Files:        fileSvc,
+		Public:       pubSvc,
+		Shares:       shareSvc,
+		Sessions:     sessSvc,
+		LoginLimiter: auth.NewLoginLimiter(time.Duration(loginLimit.WindowMinutes)*time.Minute, loginLimit.MaxFailuresPerIP, loginLimit.MaxFailuresPerUsername),
+		Tokens:       tokenSvc,
+		ImageBed:     ibSvc,
+		AnonLimiter:  imagebed.NewRateLimiter(cfg.ImageBed.AnonymousRateLimit.PerIPPerHour),
+		Capabilities: capSvc,
+		StaticAssets: staticSvc,
+		Operations:   opsSvc,
+		Audit:        audit.New(dbConn, cfg.Audit.Enabled, cfg.Audit.MaxEntries, logger),
+		Proxy:        security.NewProxyResolver(cfg.Server.TrustedProxies),
+		OIDCSettings: oidc.NewSettings(dbConn),
+		S3Keys:       s3Keys,
+		S3Multipart:  s3MP,
+		Lifecycle:    life,
+	})
+}
+
+// NewWithDeps 基于已装配好的领域服务构造 HTTP Server 与路由表。
+func NewWithDeps(deps Deps) (*http.Server, *Server) {
+	cfg := deps.Config
+	logger := deps.Logger
+	bootstrapToken := strings.TrimSpace(deps.BootstrapToken)
+	if bootstrapToken == "" {
+		bootstrapToken = strings.TrimSpace(cfg.Security.BootstrapToken)
+	}
+	if bootstrapToken == "" {
+		bootstrapToken = auth.NewRandomToken("setup-", 24)
+	}
+	s := &Server{
+		cfg:            cfg,
+		db:             deps.DB,
+		logger:         logger,
+		users:          deps.Users,
+		sources:        deps.Sources,
+		files:          deps.Files,
+		public:         deps.Public,
+		shares:         deps.Shares,
+		sessions:       deps.Sessions,
+		loginLimiter:   deps.LoginLimiter,
+		tokens:         deps.Tokens,
+		imagebed:       deps.ImageBed,
+		anonLimiter:    deps.AnonLimiter,
+		capabilities:   deps.Capabilities,
+		staticassets:   deps.StaticAssets,
+		operations:     deps.Operations,
+		audit:          deps.Audit,
+		proxy:          deps.Proxy,
+		oidcSettings:   deps.OIDCSettings,
+		s3Keys:         deps.S3Keys,
+		s3Multipart:    deps.S3Multipart,
+		lifecycle:      deps.Lifecycle,
+		bootstrapToken: bootstrapToken,
+	}
 	if count, err := s.users.Count(); err == nil && count == 0 {
 		logger.Warn("首次管理员初始化需要一次性凭据", "bootstrap_token", bootstrapToken)
 	}
-	s.sources = sources.NewService(dbConn, cfg.Data.Dir)
-	s.files = files.NewService(dbConn, s.sources, locks.NewManager())
-	s.capabilities = capabilities.NewService(dbConn, s.sources)
-	s.staticassets = staticassets.NewService(dbConn, s.sources, s.files, cfg.Server.PublicURL)
-	s.public = publicdisk.NewService(s.files, s.capabilities)
-	s.shares = shares.NewService(dbConn, s.sources, s.files, cfg.Server.PublicURL)
-	s.tokens = auth.NewTokens(dbConn)
-	s.s3Keys = s3api.NewCredentials(dbConn, cfg.Data.Dir, cfg.Security.MasterKey)
-	s.s3Multipart = s3api.NewMultipartStore(dbConn, cfg.Data.Dir, s.files, cfg.Upload.MaxFileSizeMB)
 	s.s3Handler = s3api.NewHandler(s.s3Keys, s.sources, s.files, s.audit, s.proxy, logger,
 		cfg.Upload.MaxFileSizeMB, s.s3Multipart)
-	ib, err := imagebed.NewService(dbConn, cfg.Server.PublicURL,
-		filepath.Join(cfg.Data.Dir, "cache", "thumbnails"), s.sources, s.capabilities, s.files)
-	if err != nil {
-		// 配置错误应在启动时直接失败。
-		panic(err)
-	}
-	s.imagebed = ib
-	s.anonLimiter = imagebed.NewRateLimiter(cfg.ImageBed.AnonymousRateLimit.PerIPPerHour)
-	s.operations = operations.NewService(dbConn, cfg.DatabasePath(), cfg.Data.Dir, buildinfo.Version,
-		s.sources, s.files, s.imagebed,
-		auth.NewSessions(dbConn, time.Duration(cfg.Security.SessionTTLHours)*time.Hour),
-		multipartCleanupAdapter(s.s3Multipart))
-	s.oidcSettings = oidc.NewSettings(dbConn)
 
 	mux := http.NewServeMux()
 
@@ -275,6 +352,8 @@ func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server,
 	mux.HandleFunc("POST /api/v1/admin/operations/cleanup", s.requireAdmin(s.handleAdminOperationsCleanup))
 
 	// 管理员：静态资源配置（2.0 AST）
+	mux.HandleFunc("GET /api/v1/admin/static-access/settings", s.requireAdmin(s.handleAdminGetStaticSettings))
+	mux.HandleFunc("PUT /api/v1/admin/static-access/settings", s.requireAdmin(s.handleAdminUpdateStaticSettings))
 	mux.HandleFunc("DELETE /api/v1/admin/sources/{key}/static-access/config", s.requireAdmin(s.handleAdminRemoveStaticConfig))
 	mux.HandleFunc("GET /api/v1/admin/sources/{key}/static-access/config", s.requireAdmin(s.handleAdminGetStaticConfig))
 	mux.HandleFunc("POST /api/v1/admin/sources/{key}/static-access/config", s.requireAdmin(s.handleAdminConfigureStatic))
@@ -327,42 +406,24 @@ func New(cfg *config.Config, dbConn *sql.DB, logger *slog.Logger) (*http.Server,
 	handler = WithSecurityHeaders(handler)
 
 	return &http.Server{
-		Addr:    cfg.Server.HTTPAddr,
-		Handler: handler,
+		Addr:              cfg.Server.HTTPAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}, s
 }
 
-// StartSessionCleanup 启动每小时一次的过期 Session 清理（README §21）。
-func StartSessionCleanup(sessions *auth.Sessions, logger *slog.Logger, stop <-chan struct{}) {
-	go func() {
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if n, err := sessions.CleanupExpired(); err != nil {
-					logger.Error("清理过期 session 失败", "err", err)
-				} else if n > 0 {
-					logger.Info("清理过期 session", "count", n)
-				}
-			case <-stop:
-				return
-			}
-		}
-	}()
-}
-
-// Sessions 暴露 Session 服务供 main 启动后台清理任务。
+// Sessions 暴露 Session 服务。
 func (s *Server) Sessions() *auth.Sessions {
 	return s.sessions
 }
 
-// Files 暴露文件服务供 main 启动上传残留清理任务。
+// Files 暴露文件服务。
 func (s *Server) Files() *files.Service {
 	return s.files
 }
 
-// ImageBed 暴露图床服务供 main 启动缩略图缓存清理任务。
+// ImageBed 暴露图床服务。
 func (s *Server) ImageBed() *imagebed.Service {
 	return s.imagebed
 }
@@ -375,96 +436,17 @@ func (s *Server) S3Server() *http.Server {
 	}
 }
 
-// S3Multipart 暴露 Multipart 状态服务供 main 启动过期任务清理。
+// S3Multipart 暴露 Multipart 状态服务。
 func (s *Server) S3Multipart() *s3api.MultipartStore {
 	return s.s3Multipart
 }
 
-// StartS3MultipartCleanup 在启动时及之后每小时清理超过 24 小时未活动的上传与孤儿分片。
-func StartS3MultipartCleanup(store *s3api.MultipartStore, logger *slog.Logger, stop <-chan struct{}) {
-	go func() {
-		cleanup := func() {
-			result, err := store.CleanupExpired(s3api.MultipartMaxAge)
-			if err != nil {
-				logger.Warn("清理 S3 Multipart 临时数据未完全成功", "err", err,
-					"uploads_removed", result.UploadsRemoved, "orphans_removed", result.OrphansRemoved)
-				return
-			}
-			if result.UploadsRemoved > 0 || result.OrphansRemoved > 0 {
-				logger.Info("清理 S3 Multipart 临时数据",
-					"uploads_removed", result.UploadsRemoved, "orphans_removed", result.OrphansRemoved)
-			}
-		}
-		cleanup()
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cleanup()
-			case <-stop:
-				return
-			}
-		}
-	}()
-}
-
-// multipartCleanupAdapter 适配 s3api 的清理结果签名。
-func multipartCleanupAdapter(store *s3api.MultipartStore) func(time.Duration) (int64, int64, int64, error) {
+// MultipartCleanupAdapter 适配 s3api 的清理结果签名给 operations.Service 使用。
+func MultipartCleanupAdapter(store *s3api.MultipartStore) func(time.Duration) (int64, int64, int64, error) {
 	return func(maxAge time.Duration) (int64, int64, int64, error) {
 		result, err := store.CleanupExpired(maxAge)
 		return int64(result.UploadsRemoved), int64(result.OrphansRemoved), 0, err
 	}
-}
-
-// StartWebDAVLockCleanup 在启动时及之后每小时清理过期的持久锁。
-func StartWebDAVLockCleanup(fileService *files.Service, logger *slog.Logger, stop <-chan struct{}) {
-	go func() {
-		cleanup := func() {
-			n, err := fileService.PersistentLocks().CleanupExpired(context.Background())
-			if err != nil {
-				logger.Warn("清理过期 WebDAV 锁失败", "err", err)
-			} else if n > 0 {
-				logger.Info("清理过期 WebDAV 锁", "count", n)
-			}
-		}
-		cleanup()
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cleanup()
-			case <-stop:
-				return
-			}
-		}
-	}()
-}
-
-// StartThumbnailCacheCleanup 在启动时及之后每天清理超过 30 天未使用的缩略图缓存。
-func StartThumbnailCacheCleanup(service *imagebed.Service, logger *slog.Logger, stop <-chan struct{}) {
-	go func() {
-		cleanup := func() {
-			n, err := service.CleanupThumbnailCache(30 * 24 * time.Hour)
-			if err != nil {
-				logger.Warn("清理缩略图缓存失败", "err", err)
-			} else if n > 0 {
-				logger.Info("清理缩略图缓存", "count", n)
-			}
-		}
-		cleanup()
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cleanup()
-			case <-stop:
-				return
-			}
-		}
-	}()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

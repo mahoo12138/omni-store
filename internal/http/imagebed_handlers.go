@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"path"
@@ -29,7 +30,14 @@ func readMultipartFile(w http.ResponseWriter, r *http.Request, maxBytes int64) (
 	for {
 		part, err := mr.NextPart()
 		if err != nil {
-			return nil, errors.New("缺少 file 字段")
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				return nil, err
+			}
+			if errors.Is(err, io.EOF) {
+				return nil, errors.New("缺少 file 字段")
+			}
+			return nil, errors.New("解析上传表单失败")
 		}
 		if part.FormName() == "file" {
 			return part, nil
@@ -84,7 +92,7 @@ func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", img.MimeType)
 	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("Cache-Control", imageCacheControl(img.ExpiresAt))
-	http.ServeContent(w, r, "", info.ModTime(), f)
+	serveContentWithDeadline(w, r, "", info.ModTime(), f)
 }
 
 // thumbnailCacheControl 计算缩略图缓存策略：默认 1 小时；
@@ -194,13 +202,21 @@ func (s *Server) handleImageBedStatus(w http.ResponseWriter, r *http.Request) {
 // handleImageBedUpload 网页端登录用户上传（Cookie + CSRF）。
 func (s *Server) handleImageBedUpload(w http.ResponseWriter, r *http.Request) {
 	user := CurrentUser(r.Context())
+	defer func() {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	}()
 	part, err := readMultipartFile(w, r, s.cfg.ImageBed.UserMaxFileSizeMB*1024*1024)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			WriteError(w, r, CodePayloadTooLarge, "图片超过大小限制", nil)
+			return
+		}
 		WriteError(w, r, CodeValidationError, err.Error(), nil)
 		return
 	}
 
-	img, err := s.imagebed.UploadForUser(user, path.Base(part.FileName()), part)
+	img, err := s.imagebed.UploadForUser(user, path.Base(part.FileName()), newRollingReadDeadline(w, part))
 	s.imageBedAudit(r, audit.EntryImageBed, "image_upload", &user.ID, imageStorageSourceID(img), "", err)
 	if err != nil {
 		writeImageBedError(w, r, err)
@@ -257,14 +273,22 @@ func (s *Server) handlePicGoUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defer func() {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	}()
 	part, err := readMultipartFile(w, r, s.cfg.ImageBed.UserMaxFileSizeMB*1024*1024)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writePicGo(w, http.StatusRequestEntityTooLarge, map[string]any{"success": false, "message": "图片超过大小限制"})
+			return
+		}
 		writePicGo(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 		return
 	}
 
 	// 图床上传使用 Site Capability 绑定的全局目标，不允许指定存储源 key。
-	img, err := s.imagebed.UploadForUser(user, path.Base(part.FileName()), part)
+	img, err := s.imagebed.UploadForUser(user, path.Base(part.FileName()), newRollingReadDeadline(w, part))
 	s.imageBedAudit(r, audit.EntryImageBed, "image_upload", &user.ID, imageStorageSourceID(img), "", err)
 	if err != nil {
 		msg := "上传失败"
@@ -275,7 +299,8 @@ func (s *Server) handlePicGoUpload(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, imagebed.ErrTargetInvalid):
 			msg = err.Error()
 		case errors.As(err, &maxBytesErr):
-			msg = "图片超过大小限制"
+			writePicGo(w, http.StatusRequestEntityTooLarge, map[string]any{"success": false, "message": "图片超过大小限制"})
+			return
 		case errors.Is(err, files.ErrQuotaExceeded):
 			msg = err.Error()
 			writePicGo(w, http.StatusInsufficientStorage, map[string]any{"success": false, "message": msg})
@@ -315,13 +340,21 @@ func (s *Server) handleAnonymousImageBedUpload(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	defer func() {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	}()
 	part, err := readMultipartFile(w, r, s.cfg.ImageBed.AnonymousMaxFileSizeMB*1024*1024)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			WriteError(w, r, CodePayloadTooLarge, "图片超过大小限制", nil)
+			return
+		}
 		WriteError(w, r, CodeValidationError, err.Error(), nil)
 		return
 	}
 
-	img, err := s.imagebed.UploadAnonymous(path.Base(part.FileName()), part)
+	img, err := s.imagebed.UploadAnonymous(path.Base(part.FileName()), newRollingReadDeadline(w, part))
 	s.imageBedAudit(r, audit.EntryAnonymousImageBed, "image_upload", nil, imageStorageSourceID(img), "", err)
 	if err != nil {
 		writeImageBedError(w, r, err)

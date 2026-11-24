@@ -115,7 +115,7 @@ func (s *Server) handlePublicShareRaw(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, info, unlock, err := s.shares.Files().OpenForRead(src, relPath)
+	f, info, unlock, err := s.shares.Files().OpenForReadContext(r.Context(), src, relPath)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -137,7 +137,7 @@ func (s *Server) handlePublicShareRaw(w http.ResponseWriter, r *http.Request) {
 	s.audit.Log(audit.Entry{ActorType: audit.ActorAnonymous, EntryType: audit.EntryWeb, Action: "share_download",
 		StorageSourceID: &src.ID, RelativePath: strings.TrimPrefix(relPath, "/"), IPAddress: s.proxy.ClientIP(r),
 		UserAgent: r.UserAgent(), Status: audit.StatusSuccess})
-	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+	serveContentWithDeadline(w, r, info.Name(), info.ModTime(), f)
 }
 
 // handlePublicShareArchive 以流式 ZIP 打包下载分享目录（含 ?path= 指定的子目录）。

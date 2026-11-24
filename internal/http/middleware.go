@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"time"
 )
 
@@ -51,12 +53,43 @@ func WithSecurityHeaders(next http.Handler) http.Handler {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
+}
+
+func (sr *statusRecorder) Unwrap() http.ResponseWriter {
+	return sr.ResponseWriter
+}
+
+func (sr *statusRecorder) WroteHeader() bool {
+	return sr.wroteHeader
 }
 
 func (sr *statusRecorder) WriteHeader(code int) {
+	if sr.wroteHeader {
+		return
+	}
 	sr.status = code
+	sr.wroteHeader = true
 	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Write(b []byte) (int, error) {
+	if !sr.wroteHeader {
+		sr.wroteHeader = true
+	}
+	return sr.ResponseWriter.Write(b)
+}
+
+// ReadFrom 透传底层 io.ReaderFrom，保证 http.ServeContent 等下载路径可走 sendfile。
+func (sr *statusRecorder) ReadFrom(r io.Reader) (int64, error) {
+	if !sr.wroteHeader {
+		sr.wroteHeader = true
+	}
+	if rf, ok := sr.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(sr.ResponseWriter, r)
 }
 
 // WithAccessLog 记录基础访问日志。
@@ -75,13 +108,34 @@ func WithAccessLog(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
+type headerWriteState interface {
+	WroteHeader() bool
+}
+
 // WithRecover 捕获 handler panic，返回统一 INTERNAL_ERROR。
+// 遵循 net/http 约定放行 http.ErrAbortHandler，且在响应头已写出后不再追加破坏流的 JSON。
 func WithRecover(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state, ok := w.(headerWriteState)
+		if !ok {
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			w = rec
+			state = rec
+		}
 		defer func() {
 			if err := recover(); err != nil {
-				logger.Error("panic", "err", err, "path", r.URL.Path, "request_id", RequestIDFrom(r.Context()))
-				WriteError(w, r, CodeInternalError, "服务器内部错误", nil)
+				if err == http.ErrAbortHandler {
+					panic(err)
+				}
+				logger.Error("panic",
+					"err", err,
+					"path", r.URL.Path,
+					"request_id", RequestIDFrom(r.Context()),
+					"stack", string(debug.Stack()),
+				)
+				if !state.WroteHeader() {
+					WriteError(w, r, CodeInternalError, "服务器内部错误", nil)
+				}
 			}
 		}()
 		next.ServeHTTP(w, r)

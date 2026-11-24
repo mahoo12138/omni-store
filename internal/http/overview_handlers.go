@@ -3,7 +3,6 @@ package httpserver
 import (
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/omni-store/omnistore/internal/buildinfo"
 	"github.com/omni-store/omnistore/internal/capabilities"
@@ -42,9 +41,8 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			WebdavStatus: "已启用",
 		},
 	}
-	var val string
-	if err := s.db.QueryRow(`SELECT value FROM system_settings WHERE key = 'anonymous_image_bed_enabled'`).Scan(&val); err == nil {
-		out.AnonymousImageBedOn = val == "1" || strings.EqualFold(val, "true")
+	if anon, err := s.imagebed.GetAnonymousSettings(); err == nil {
+		out.AnonymousImageBedOn = anon.Enabled
 	}
 	WriteData(w, r, out)
 }

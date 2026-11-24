@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/omni-store/omnistore/internal/app"
 	"github.com/omni-store/omnistore/internal/audit"
 	"github.com/omni-store/omnistore/internal/auth"
 	"github.com/omni-store/omnistore/internal/backup"
@@ -29,7 +30,6 @@ import (
 	"github.com/omni-store/omnistore/internal/config"
 	"github.com/omni-store/omnistore/internal/datadir"
 	"github.com/omni-store/omnistore/internal/db"
-	httpserver "github.com/omni-store/omnistore/internal/http"
 	"github.com/omni-store/omnistore/internal/users"
 )
 
@@ -105,101 +105,31 @@ func runServer(args []string) error {
 		return err
 	}
 
-	dbConn, err := db.Open(cfg.DatabasePath())
+	pool, err := db.OpenPool(cfg.DatabasePath())
 	if err != nil {
 		return err
 	}
-	defer dbConn.Close()
+	defer pool.Close()
 	logger.Info("数据库就绪", "path", cfg.DatabasePath())
 
-	srv, app := httpserver.New(cfg, dbConn, logger)
-	pathRecovery, err := app.Files().RecoverPathOperations()
+	application, err := app.New(cfg, pool, logger)
 	if err != nil {
-		return fmt.Errorf("恢复中断的移动或永久删除失败: %w", err)
+		return err
 	}
-	if pathRecovery.CompletedMoves+pathRecovery.RolledBackMoves+pathRecovery.CompletedDeletes > 0 {
-		logger.Info("已恢复中断的移动或永久删除",
-			"completed_moves", pathRecovery.CompletedMoves,
-			"rolled_back_moves", pathRecovery.RolledBackMoves,
-			"completed_deletes", pathRecovery.CompletedDeletes)
-	}
-	copyRecovery, err := app.Files().RecoverCopyOperations()
-	if err != nil {
-		return fmt.Errorf("恢复中断的跨来源复制失败: %w", err)
-	}
-	if copyRecovery.CompletedCopies+copyRecovery.RolledBackCopies > 0 {
-		logger.Info("已恢复中断的跨来源复制",
-			"completed_copies", copyRecovery.CompletedCopies,
-			"rolled_back_copies", copyRecovery.RolledBackCopies)
-	}
-	transferRecovery, err := app.Files().RecoverTransferOperations()
-	if err != nil {
-		return fmt.Errorf("恢复中断的跨来源移动失败: %w", err)
-	}
-	if transferRecovery.CompletedMoves+transferRecovery.RolledBackMoves > 0 {
-		logger.Info("已恢复中断的跨来源移动",
-			"completed_moves", transferRecovery.CompletedMoves,
-			"rolled_back_moves", transferRecovery.RolledBackMoves)
-	}
-	trashRecovery, err := app.Files().RecoverTrashOperations()
-	if err != nil {
-		return fmt.Errorf("恢复中断的回收站操作失败: %w", err)
-	}
-	if trashRecovery.CompletedMoves+trashRecovery.RolledBackMoves+
-		trashRecovery.CompletedRestores+trashRecovery.RolledBackRestores+
-		trashRecovery.CompletedPurges > 0 {
-		logger.Info("已恢复中断的回收站操作",
-			"completed_moves", trashRecovery.CompletedMoves,
-			"rolled_back_moves", trashRecovery.RolledBackMoves,
-			"completed_restores", trashRecovery.CompletedRestores,
-			"rolled_back_restores", trashRecovery.RolledBackRestores,
-			"completed_purges", trashRecovery.CompletedPurges)
-	}
-	fileUploadRecovery, err := app.Files().RecoverFileUploadOperations()
-	if err != nil {
-		return fmt.Errorf("恢复中断的普通文件上传失败: %w", err)
-	}
-	if fileUploadRecovery.CompletedUploads+fileUploadRecovery.RolledBackUploads > 0 {
-		logger.Info("已恢复中断的普通文件上传",
-			"completed_uploads", fileUploadRecovery.CompletedUploads,
-			"rolled_back_uploads", fileUploadRecovery.RolledBackUploads)
-	}
-	multipartPartRecovery, err := app.S3Multipart().RecoverMultipartPartOperations()
-	if err != nil {
-		return fmt.Errorf("恢复中断的 S3 Multipart 分片上传失败: %w", err)
-	}
-	if multipartPartRecovery.CompletedParts+multipartPartRecovery.RolledBackParts > 0 {
-		logger.Info("已恢复中断的 S3 Multipart 分片上传",
-			"completed_parts", multipartPartRecovery.CompletedParts,
-			"rolled_back_parts", multipartPartRecovery.RolledBackParts)
-	}
-	multipartRecovery, err := app.S3Multipart().RecoverMultipartCompletions()
-	if err != nil {
-		return fmt.Errorf("恢复中断的 S3 Multipart 完成操作失败: %w", err)
-	}
-	if multipartRecovery.CompletedUploads+multipartRecovery.RolledBackUploads > 0 {
-		logger.Info("已恢复中断的 S3 Multipart 完成操作",
-			"completed_uploads", multipartRecovery.CompletedUploads,
-			"rolled_back_uploads", multipartRecovery.RolledBackUploads)
-	}
-	uploadRecovery, err := app.ImageBed().RecoverUploadOperations()
-	if err != nil {
-		return fmt.Errorf("恢复中断的图床上传失败: %w", err)
-	}
-	if uploadRecovery.CompletedUploads+uploadRecovery.RolledBackUploads > 0 {
-		logger.Info("已恢复中断的图床上传",
-			"completed_uploads", uploadRecovery.CompletedUploads,
-			"rolled_back_uploads", uploadRecovery.RolledBackUploads)
-	}
-	stopCleanup := make(chan struct{})
-	httpserver.StartSessionCleanup(app.Sessions(), logger, stopCleanup)
-	if cfg.Server.S3Enabled {
-		httpserver.StartS3MultipartCleanup(app.S3Multipart(), logger, stopCleanup)
-	}
-	httpserver.StartWebDAVLockCleanup(app.Files(), logger, stopCleanup)
-	httpserver.StartThumbnailCacheCleanup(app.ImageBed(), logger, stopCleanup)
-	defer close(stopCleanup)
+	defer application.Close()
 
+	if err := application.RecoverAll(); err != nil {
+		return err
+	}
+
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	waitWorkers := application.StartBackgroundWorkers(bgCtx)
+	defer func() {
+		bgCancel()
+		waitWorkers()
+	}()
+
+	srv := application.HTTPServer()
 	servers := []*http.Server{srv}
 	errCh := make(chan error, 2)
 	go func() {
@@ -209,7 +139,7 @@ func runServer(args []string) error {
 		}
 	}()
 	if cfg.Server.S3Enabled {
-		s3Srv := app.S3Server()
+		s3Srv := application.S3Server()
 		servers = append(servers, s3Srv)
 		go func() {
 			logger.Info("S3 服务启动", "addr", cfg.Server.S3Addr, "style", "path")

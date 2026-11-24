@@ -77,7 +77,7 @@ func (s *Server) handleStaticAsset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", staticassets.ResolvedETag(resolved.Info))
 	// http.ServeContent 处理条件请求与单段 Range（206/416/304），流式读取不整段缓冲；
 	// ETag 为弱验证器，If-Range 无强验证依据时按 RFC 9110 返回完整 200。
-	http.ServeContent(w, r, "", resolved.ModTime(), resolved.File)
+	serveContentWithDeadline(w, r, "", resolved.ModTime(), resolved.File)
 }
 
 func (s *Server) handleStaticAssetOptions(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +132,7 @@ func writeStaticConfigError(w http.ResponseWriter, r *http.Request, err error) {
 func (s *Server) handleAdminConfigureStatic(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PublishRoot        string   `json:"publish_root"`
+		Enabled            *bool    `json:"enabled"`
 		CacheMode          string   `json:"cache_mode"`
 		CorsMode           string   `json:"cors_mode"`
 		PublicOrigin       string   `json:"public_origin"`
@@ -145,6 +146,7 @@ func (s *Server) handleAdminConfigureStatic(w http.ResponseWriter, r *http.Reque
 	cfg, err := s.staticassets.Configure(staticassets.ConfigureInput{
 		SourceKey:          r.PathValue("key"),
 		PublishRoot:        req.PublishRoot,
+		Enabled:            req.Enabled,
 		CacheMode:          req.CacheMode,
 		CorsMode:           req.CorsMode,
 		PublicOrigin:       req.PublicOrigin,
@@ -261,4 +263,42 @@ func (s *Server) handleAdminRemoveStaticConfig(w http.ResponseWriter, r *http.Re
 	}
 	s.adminAudit(r, "remove_static_access", audit.StatusSuccess, "")
 	WriteData(w, r, map[string]any{"ok": true})
+}
+
+func (s *Server) handleAdminGetStaticSettings(w http.ResponseWriter, r *http.Request) {
+	view, err := s.staticassets.GlobalSettingsView()
+	if err != nil {
+		WriteError(w, r, CodeInternalError, "查询静态 HTTP 配置失败", nil)
+		return
+	}
+	WriteData(w, r, view)
+}
+
+func (s *Server) handleAdminUpdateStaticSettings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PublicOrigin   string   `json:"public_origin"`
+		CacheMode      string   `json:"cache_mode"`
+		CorsMode       string   `json:"cors_mode"`
+		AllowedOrigins []string `json:"allowed_origins"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	user := CurrentUser(r.Context())
+	var actorID *int64
+	if user != nil {
+		actorID = &user.ID
+	}
+	view, err := s.staticassets.SaveGlobalSettings(staticassets.GlobalSettings{
+		PublicOrigin:   req.PublicOrigin,
+		CacheMode:      req.CacheMode,
+		CorsMode:       req.CorsMode,
+		AllowedOrigins: req.AllowedOrigins,
+	}, actorID, s.audit)
+	if err != nil {
+		writeStaticConfigError(w, r, err)
+		return
+	}
+	s.adminAudit(r, "update_static_http_settings", audit.StatusSuccess, "")
+	WriteData(w, r, view)
 }
