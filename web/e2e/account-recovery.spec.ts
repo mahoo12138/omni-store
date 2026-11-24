@@ -38,7 +38,8 @@ test('password change closes other sessions and administrator can revoke all cre
 
     await currentPage.getByRole('button', { name: new RegExp('账号菜单') }).click()
     await currentPage.getByRole('menuitem', { name: '账户设置' }).click()
-    await currentPage.getByRole('button', { name: '修改密码' }).click()
+    await currentPage.getByRole('button', { name: '账户操作', exact: true }).click()
+    await currentPage.getByRole('menuitem', { name: '修改密码', exact: true }).click()
     const passwordDialog = currentPage.getByRole('dialog', { name: '修改密码' })
     await passwordDialog.getByLabel('旧密码').fill(initialPassword)
     await passwordDialog.getByLabel('新密码（至少 8 位）').fill(recoveredPassword)

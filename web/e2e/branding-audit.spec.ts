@@ -67,11 +67,13 @@ test('instance branding updates the public shell and restores the default name',
   const brandingValue = page.getByText('实例名称', { exact: true }).locator('..')
   await expect(brandingValue).toContainText('OmniStore')
 
-  // 1. 修改实例名称并保存；表单关闭回到 kv 展示后断言新名称。
+  // 1. 修改实例名称并保存；通过弹窗修改后回到 kv 展示并断言新名称。
   await page.getByRole('button', { name: '修改名称' }).click()
-  await page.getByRole('textbox', { name: /实例名称/ }).fill(brandName)
-  await page.getByRole('button', { name: '保存', exact: true }).click()
-  await expect(page.getByRole('textbox', { name: /实例名称/ })).toHaveCount(0)
+  const brandingDialog = page.getByRole('dialog', { name: '修改名称', exact: true })
+  await expect(brandingDialog).toBeVisible()
+  await brandingDialog.getByRole('textbox', { name: /实例名称/ }).fill(brandName)
+  await brandingDialog.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(brandingDialog).toBeHidden()
   await expect(brandingValue).toContainText(brandName)
 
   // 2. 公开侧外壳立即展示新名称（头部品牌与页脚）。
@@ -82,9 +84,10 @@ test('instance branding updates the public shell and restores the default name',
   // （注：输入框带原生 required，"清空保存" 会被浏览器拦截，无法从 UI 走通。）
   await page.goto('/app/admin?section=site&tab=general')
   await page.getByRole('button', { name: '修改名称' }).click()
-  await page.getByRole('textbox', { name: /实例名称/ }).fill('OmniStore')
-  await page.getByRole('button', { name: '保存', exact: true }).click()
-  await expect(page.getByRole('textbox', { name: /实例名称/ })).toHaveCount(0)
+  await expect(brandingDialog).toBeVisible()
+  await brandingDialog.getByRole('textbox', { name: /实例名称/ }).fill('OmniStore')
+  await brandingDialog.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(brandingDialog).toBeHidden()
   await expect(brandingValue).toContainText('OmniStore')
   await page.goto('/')
   await expect(page.getByRole('link', { name: '返回 OmniStore 公开网盘' })).toBeVisible()

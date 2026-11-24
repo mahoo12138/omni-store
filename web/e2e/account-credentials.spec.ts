@@ -60,7 +60,8 @@ test('display name change takes effect immediately and can be restored', async (
   await openProfile(page)
 
   // 1. 修改显示名并保存。
-  await page.getByRole('button', { name: '修改显示名' }).click()
+  await page.getByRole('button', { name: '账户操作', exact: true }).click()
+  await page.getByRole('menuitem', { name: '修改显示名', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: '修改显示名' })
   await dialog.getByLabel('新的显示名').fill(newName)
   await dialog.getByRole('button', { name: '保存', exact: true }).click()
@@ -73,7 +74,8 @@ test('display name change takes effect immediately and can be restored', async (
 
   // 3. 恢复默认显示名。
   await openProfile(page)
-  await page.getByRole('button', { name: '修改显示名' }).click()
+  await page.getByRole('button', { name: '账户操作', exact: true }).click()
+  await page.getByRole('menuitem', { name: '修改显示名', exact: true }).click()
   const restoreDialog = page.getByRole('dialog', { name: '修改显示名' })
   await restoreDialog.getByLabel('新的显示名').fill('演示用户')
   await restoreDialog.getByRole('button', { name: '保存', exact: true }).click()

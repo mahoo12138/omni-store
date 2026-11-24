@@ -3,11 +3,11 @@
 # Run with:  ./scripts/test-env.sh run
 
 server:
-  http_addr: "127.0.0.1:18080"
-  public_url: "http://127.0.0.1:18080"
+  http_addr: "127.0.0.1:28080"
+  public_url: "http://127.0.0.1:28080"
   trusted_proxies:
     - "127.0.0.1"
-  s3_addr: "127.0.0.1:18081"
+  s3_addr: "127.0.0.1:28081"
   s3_enabled: true
 
 data:

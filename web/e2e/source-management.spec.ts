@@ -87,8 +87,8 @@ test('admin creates a source through preflight and deletes it under guards', asy
 
     // 3. 能力绑定守卫：删除被公开网盘绑定的种子源被拒绝（原生 alert）。
     await adminSourcesSection(page)
-    const publicCard = page.locator('article').filter({ hasText: '公开演示资料' }).first()
-    await publicCard.getByRole('button', { name: '删除存储源 公开演示资料' }).click()
+    const publicRow = page.getByRole('row').filter({ hasText: '公开演示资料' }).first()
+    await publicRow.getByRole('button', { name: '删除存储源 公开演示资料' }).click()
     const guardDialog = page.getByRole('dialog', { name: '删除存储源' })
     let guardAlert = ''
     page.once('dialog', (alertDialog) => {
@@ -110,8 +110,8 @@ test('admin creates a source through preflight and deletes it under guards', asy
     await expect(page.getByRole('row', { name: new RegExp(fileName) })).toHaveCount(0)
 
     await adminSourcesSection(page)
-    const newCard = page.locator('article').filter({ hasText: sourceName }).first()
-    await newCard.getByRole('button', { name: `删除存储源 ${sourceName}` }).click()
+    const newRow = page.getByRole('row').filter({ hasText: sourceName }).first()
+    await newRow.getByRole('button', { name: `删除存储源 ${sourceName}` }).click()
     const deleteDialog = page.getByRole('dialog', { name: '删除存储源' })
     let trashAlert = ''
     page.once('dialog', (alertDialog) => {
@@ -137,11 +137,11 @@ test('admin creates a source through preflight and deletes it under guards', asy
     await expect(rows).toHaveCount(0)
 
     await adminSourcesSection(page)
-    await newCard.getByRole('button', { name: `删除存储源 ${sourceName}` }).click()
+    await newRow.getByRole('button', { name: `删除存储源 ${sourceName}` }).click()
     const finalDialog = page.getByRole('dialog', { name: '删除存储源' })
     await finalDialog.getByRole('button', { name: '确认删除' }).click()
     await expect(finalDialog).toHaveCount(0)
-    await expect(page.locator('article').filter({ hasText: sourceName })).toHaveCount(0)
+    await expect(page.getByRole('row').filter({ hasText: sourceName })).toHaveCount(0)
   } finally {
     // 兜底：API 删除残留源（先清其回收站），并移除磁盘目录。
     const list = await adminAPI(page, 'GET', '/api/v1/admin/sources')

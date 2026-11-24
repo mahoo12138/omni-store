@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-// 与普通文件上传组合验证；两个源使用同一文件名和不同内容。
+// 存储源内一键开启静态 HTTP 访问；CDN / 对外域名、缓存与跨域等在「应用与客户端连接 → 静态 HTTP」中管理。
 for (const viewport of [{ width: 1440, height: 1000 }, { width: 375, height: 812 }]) {
   test(`static HTTP is configured per source at ${viewport.width}px`, async ({ page, request }) => {
     await page.setViewportSize(viewport)
@@ -31,32 +31,16 @@ for (const viewport of [{ width: 1440, height: 1000 }, { width: 375, height: 812
         await page.getByRole('button', { name: `配置存储源 ${source.name}` }).click()
         const dialog = page.getByRole('dialog', { name: `配置：${source.name}`, exact: true })
         await expect(dialog).toContainText(source.name)
-        const webdav = dialog.getByRole('checkbox', { name: '启用 WebDAV', exact: true })
-        const originalWebdav = await webdav.isChecked()
-        await webdav.setChecked(!originalWebdav)
-        await dialog.getByRole('button', { name: '配置静态 HTTP', exact: true }).click()
-        await dialog.getByLabel('静态资源发布目录').fill('')
-        await dialog.getByRole('button', { name: '收起静态 HTTP', exact: true }).click()
-        await dialog.getByRole('tab', { name: '存储设置', exact: true }).click()
-        await dialog.getByRole('tab', { name: '访问协议', exact: true }).click()
-        await dialog.getByRole('button', { name: '配置静态 HTTP', exact: true }).click()
-        await expect(dialog.getByLabel('静态资源发布目录')).toHaveValue('')
-        await dialog.getByRole('button', { name: '预检发布目录' }).click()
-        await expect(dialog.getByText(/样例条目：/)).toBeVisible()
-        const create = dialog.getByRole('button', { name: '创建发布空间' })
-        await expect(create).toBeDisabled()
-        await dialog.getByRole('checkbox', { name: '我确认公开此存储源根目录内的受支持媒体文件' }).check()
-        await create.click()
-        await expect(dialog).toContainText('公开读取中')
-        await expect(webdav).toBeChecked({ checked: !originalWebdav })
-        const sourceDetail = (await (await page.request.get(`/api/v1/admin/sources/${source.key}`)).json()).data
-        expect(sourceDetail.source.webdav_enabled).toBe(originalWebdav)
+
+        // 与 WebDAV / S3 一致：在存储源访问协议中勾选即可立即生效。
+        await dialog.getByRole('checkbox', { name: '启用静态 HTTP', exact: true }).check()
+        await dialog.getByRole('button', { name: '保存设置', exact: true }).click()
+        await expect(dialog).toBeHidden()
+
         const config = (await (await page.request.get(`/api/v1/admin/sources/${source.key}/static-access/config`)).json()).data
-        await expect(dialog).toContainText(config.base_url)
-        await dialog.getByRole('button', { name: '复制', exact: true }).scrollIntoViewIfNeeded()
-        await expect(dialog.getByRole('button', { name: '复制', exact: true })).toBeInViewport()
+        expect(config.enabled).toBe(true)
+        expect(config.publish_root).toBe('')
         published.push({ key: source.key, id: config.public_asset_id, url: `${config.base_url}${encodeURIComponent(filename)}`, bytes })
-        await dialog.getByRole('button', { name: '关闭弹窗' }).click()
       }
       expect(published[0].id).not.toBe(published[1].id)
       for (const publication of published) {
@@ -64,25 +48,40 @@ for (const viewport of [{ width: 1440, height: 1000 }, { width: 375, height: 812
         expect(response.status()).toBe(200)
         expect(await response.body()).toEqual(publication.bytes)
       }
+
       const first = selected[0]
       await page.getByRole('button', { name: `配置存储源 ${first.name}` }).click()
       const dialog = page.getByRole('dialog', { name: `配置：${first.name}`, exact: true })
-      await dialog.getByRole('button', { name: '配置静态 HTTP', exact: true }).click()
-      await dialog.getByRole('checkbox', { name: '提供公开读取' }).uncheck()
-      await dialog.getByRole('button', { name: '保存静态 HTTP', exact: true }).click()
-      await expect(dialog).toContainText('已关闭（原站 404）')
+      await dialog.getByRole('checkbox', { name: '启用静态 HTTP', exact: true }).uncheck()
+      await dialog.getByRole('button', { name: '保存设置', exact: true }).click()
+      await expect(dialog).toBeHidden()
       expect((await request.get(published[0].url)).status()).toBe(404)
       expect((await request.get(published[1].url)).status()).toBe(200)
-      await dialog.getByRole('checkbox', { name: '提供公开读取' }).check()
-      await dialog.getByRole('button', { name: '保存静态 HTTP', exact: true }).click()
-      await expect(dialog).toContainText('公开读取中')
+
+      await page.getByRole('button', { name: `配置存储源 ${first.name}` }).click()
+      await dialog.getByRole('checkbox', { name: '启用静态 HTTP', exact: true }).check()
+      await dialog.getByRole('button', { name: '保存设置', exact: true }).click()
+      await expect(dialog).toBeHidden()
       expect((await request.get(published[0].url)).status()).toBe(200)
-      await expect(dialog).toContainText(published[0].id)
-      expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+
+      // 在「应用与客户端连接 → 静态 HTTP」只配置全局 HTTP 参数（CDN / 缓存 / 跨域），与存储源分离。
+      await page.goto('/app/settings?section=profile')
+      await page.getByRole('navigation', { name: '连接类型' }).getByRole('button', { name: '管理 静态 HTTP' }).click()
+      const staticDialog = page.getByRole('dialog', { name: '静态 HTTP', exact: true })
+      await expect(staticDialog).toBeVisible()
+      await expect(staticDialog).toContainText(published[0].id)
+      await staticDialog.getByLabel('静态资源对外 origin').fill('https://cdn.example.test')
+      await staticDialog.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(staticDialog).toBeHidden()
+      await page.getByRole('navigation', { name: '连接类型' }).getByRole('button', { name: '管理 静态 HTTP' }).click()
+      await expect(staticDialog).toContainText('https://cdn.example.test/assets/')
+      await expect(staticDialog.getByRole('button', { name: '复制', exact: true }).first()).toBeVisible()
+      expect(await staticDialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
+      await staticDialog.getByLabel('静态资源对外 origin').fill('')
+      await staticDialog.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(staticDialog).toBeHidden()
       expect(errors).toEqual([])
-      await dialog.getByRole('button', { name: '更换发布空间' }).scrollIntoViewIfNeeded()
-      await page.screenshot({ path: `/tmp/omni-static-${viewport.width}.png`, fullPage: false })
     } finally {
       // 每个测试只撤销自己创建的公开配置，普通文件清理走既有回收站流程。
       for (const publication of published) {

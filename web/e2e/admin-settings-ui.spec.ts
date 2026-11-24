@@ -33,8 +33,8 @@ test('storage source settings stay clear and usable on desktop and mobile', asyn
 
   await expect(page.getByRole('heading', { name: '存储源', exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: '新建存储源', exact: true })).toBeVisible()
-  await expect(page.getByRole('listitem', { name: '存储源 公开演示资料' })).toBeVisible()
-  await expect(page.getByRole('listitem', { name: '存储源 团队文件' })).toBeVisible()
+  await expect(page.getByRole('row').filter({ hasText: '公开演示资料' }).first()).toBeVisible()
+  await expect(page.getByRole('row').filter({ hasText: '团队文件' }).first()).toBeVisible()
   await expect(page.getByRole('button', { name: /配置静态 HTTP/ })).toHaveCount(0)
   await page.screenshot({ path: '/tmp/omni-sources-desktop.png' })
 
@@ -99,8 +99,7 @@ test('storage source settings stay clear and usable on desktop and mobile', asyn
     document.documentElement.scrollWidth > document.documentElement.clientWidth
   ))
   expect(hasHorizontalOverflow).toBe(false)
-  const sourceRegion = page.getByRole('region', { name: '存储源', exact: true })
-  expect(await sourceRegion.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+  await expectLocalHorizontalScroll(page, '存储源')
   await page.screenshot({ path: '/tmp/omni-sources-mobile.png' })
   await page.getByRole('button', { name: '配置存储源 团队文件' }).click()
   await expect(settingsDialog).toBeVisible()
@@ -133,40 +132,31 @@ test('source cards and configuration reflow with long names and paths', async ({
     await route.fulfill({ response, json: body })
   })
   await page.goto('/app/admin?section=sources')
-  const card = page.getByRole('listitem', { name: `存储源 ${longName}`, exact: true })
+  const row = page.getByRole('row').filter({ hasText: longName }).first()
   const region = page.getByRole('region', { name: '存储源', exact: true })
-  await expect(card).toContainText('静态 HTTP')
+  await expect(row).toContainText('静态 HTTP')
   await expect(region).toContainText('均未启用')
   for (const width of [1455, 1119, 893, 727, 375, 320]) {
     await page.setViewportSize({ width, height: 887 })
-    await expect(card).toBeVisible()
-    const bounds = await card.evaluate((element) => {
-      const cardRect = element.getBoundingClientRect()
-      const path = element.querySelector('code')!.getBoundingClientRect()
-      const heading = element.querySelector('h3')!.getBoundingClientRect()
-      const configure = element.querySelector('button')!.getBoundingClientRect()
-      const actions = Array.from(element.querySelectorAll('button')).map((button) => button.getBoundingClientRect())
-      return { fits: element.scrollWidth <= element.clientWidth, pathRight: path.right, pathLeft: path.left,
-        cardRight: cardRect.right, cardLeft: cardRect.left, headingBottom: heading.bottom, pathTop: path.top,
-        configureRight: configure.right, configureLeft: configure.left,
-        actionsInside: actions.every((rect) => rect.left >= cardRect.left && rect.right <= cardRect.right + 0.5) }
+    await expect(row).toBeVisible()
+    const cellBounds = await row.evaluate((element) => {
+      const cell = element.querySelector('td')!
+      const cellRect = cell.getBoundingClientRect()
+      const path = cell.querySelector('code')!.getBoundingClientRect()
+      return {
+        cellWidth: cellRect.width,
+        pathInside: path.left >= cellRect.left - 0.5 && path.right <= cellRect.right + 0.5,
+      }
     })
-    expect(bounds.fits).toBe(true)
-    expect(bounds.pathRight).toBeLessThanOrEqual(bounds.cardRight)
-    expect(bounds.pathLeft).toBeGreaterThanOrEqual(bounds.cardLeft)
-    expect(bounds.pathTop).toBeGreaterThanOrEqual(bounds.headingBottom)
-    // 资源行布局：操作与身份同一行，只保证落在卡片边界内（不再要求排在路径下方）。
-    expect(bounds.configureLeft).toBeGreaterThanOrEqual(bounds.cardLeft)
-    expect(bounds.configureRight).toBeLessThanOrEqual(bounds.cardRight)
-    expect(bounds.actionsInside).toBe(true)
-    expect(await region.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+    expect(cellBounds.cellWidth).toBeLessThanOrEqual(400)
+    expect(cellBounds.pathInside).toBe(true)
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
-    await card.getByRole('button', { name: `配置存储源 ${longName}`, exact: true }).click()
+    await row.getByRole('button', { name: `配置存储源 ${longName}`, exact: true }).click()
     const dialog = page.getByRole('dialog', { name: `配置：${longName}`, exact: true })
     await expect(dialog).toBeVisible()
     expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
     const contentArea = dialog.getByRole('tabpanel', { name: '访问协议', exact: true })
-    await expect(contentArea.getByRole('button', { name: '配置静态 HTTP', exact: true })).toBeInViewport()
+    await expect(contentArea.getByRole('checkbox', { name: '启用静态 HTTP', exact: true })).toBeInViewport()
     await expect(dialog.getByRole('button', { name: '关闭弹窗' })).toBeInViewport()
     if ([1455, 320].includes(width)) await page.screenshot({ path: `/tmp/omni-source-long-${width}.png` })
     await dialog.getByRole('button', { name: '关闭弹窗' }).click()
@@ -267,6 +257,11 @@ test('credential overview opens one isolated management modal at a time', async 
     await expect(revealedWebdavToken).toBeVisible()
     const tokenInput = revealedWebdavToken.getByLabel('Token')
     await expect(tokenInput).not.toHaveValue('')
+    const tokenInputBox = await tokenInput.boundingBox()
+    expect(tokenInputBox?.height ?? Infinity).toBeLessThan(44)
+    expect(tokenInputBox?.width ?? 0).toBeGreaterThan(220)
+    const tokenDescBox = await revealedWebdavToken.getByText('请立即复制保存，关闭后不再显示。').boundingBox()
+    expect(tokenDescBox?.height ?? Infinity).toBeLessThan(32)
     const tokenLabel = revealedWebdavToken.locator('label').filter({ hasText: 'Token' })
     expect(await tokenLabel.getAttribute('for')).toBe(await tokenInput.getAttribute('id'))
     await revealedWebdavToken.getByRole('button', { name: '关闭', exact: true }).click()
@@ -345,6 +340,7 @@ test('admin data regions scroll locally without squeezing narrow layouts', async
 
   const dataRegions = [
     { section: 'stats', name: '存储源健康' },
+    { section: 'sources', name: '存储源' },
     { section: 'policies', name: '访问策略' },
     { section: 'users', name: '用户' },
     { section: 'audit', name: '审计日志' },
@@ -448,7 +444,8 @@ test('every admin section remains readable and keeps its active navigation visib
   const accountNameBox = await accountName.boundingBox()
   expect(accountNameBox?.height ?? Infinity).toBeLessThan(48)
 
-  await page.getByRole('button', { name: '修改显示名', exact: true }).click()
+  await page.getByRole('button', { name: '账户操作', exact: true }).click()
+  await page.getByRole('menuitem', { name: '修改显示名', exact: true }).click()
   await expect(page.getByRole('dialog', { name: '修改显示名' })).toBeVisible()
   await page.getByRole('button', { name: '取消', exact: true }).click()
 

@@ -137,14 +137,18 @@ test('site services persist state transitions, reject failed saves and recover c
         await page.getByRole('link', { name: /前往系统设置/ }).click()
         await expect.poll(() => new URL(page.url()).searchParams.get('section')).toBe('site')
         // Closing a saved anonymous gate remains possible while the parent service is off.
-        const gate = serviceCard(page, service.name).getByRole('checkbox', { name: '允许匿名上传', exact: true })
+        const gateDialog = await openService(page, service.name)
+        const gate = gateDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })
         await expect(gate).toBeChecked()
         await expect(gate).toBeEnabled()
         const gateClosed = page.waitForResponse((response) => response.url().endsWith('/api/v1/admin/image-bed/anonymous-settings') && response.request().method() === 'PUT')
         await gate.uncheck()
+        await saveService(page, gateDialog, service.capability, firstSource.key, false)
         expect((await gateClosed).status()).toBe(200)
-        await expect(gate).toBeDisabled()
         expect((await read<AnonymousSettings>(page, '/api/v1/admin/image-bed/anonymous-settings')).enabled).toBe(false)
+        const reopenedGateDialog = await openService(page, service.name)
+        await expect(reopenedGateDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })).toBeDisabled()
+        await reopenedGateDialog.getByRole('button', { name: '取消', exact: true }).click()
       }
 
       await openService(page, service.name)
@@ -158,7 +162,9 @@ test('site services persist state transitions, reject failed saves and recover c
       await dialog.getByRole('checkbox', { name: '启用服务', exact: true }).uncheck()
       await saveService(page, dialog, service.capability, '', false)
       if (service.capability === 'image_bed') {
-        await expect(serviceCard(page, service.name).getByRole('checkbox', { name: '允许匿名上传', exact: true })).toBeDisabled()
+        const unboundDialog = await openService(page, service.name)
+        await expect(unboundDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })).toBeDisabled()
+        await unboundDialog.getByRole('button', { name: '取消', exact: true }).click()
       }
 
       await openService(page, service.name)
@@ -211,77 +217,84 @@ test('site services persist state transitions, reject failed saves and recover c
     await failedDialog.getByRole('button', { name: '取消', exact: true }).click()
 
     const imageCard = serviceCard(page, '快速图床')
-    const anonymous = imageCard.getByRole('checkbox', { name: '允许匿名上传', exact: true })
-    await expect(anonymous).toBeEnabled()
+    await expect(imageCard.getByRole('checkbox', { name: '允许匿名上传', exact: true })).toHaveCount(0)
+    await expect(imageCard.getByRole('button', { name: '保留策略', exact: true })).toHaveCount(0)
     // Starting from off exercises the old disabled-settings API returning an empty key.
     await mutate(page, csrf, '/api/v1/admin/image-bed/anonymous-settings', { enabled: false })
     await page.reload()
-    await expect(anonymous).not.toBeChecked()
     const anonymousFailure = 'E2E 匿名设置保存失败'
+    const failedAnonDialog = await openService(page, '快速图床')
+    const failedAnonCheckbox = failedAnonDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })
+    await expect(failedAnonCheckbox).toBeEnabled()
+    await expect(failedAnonCheckbox).not.toBeChecked()
     await page.route('**/api/v1/admin/image-bed/anonymous-settings', async (route) => {
       if (route.request().method() !== 'PUT') return route.continue()
       await route.fulfill({ status: 500, json: { error: { code: 'INTERNAL_ERROR', message: anonymousFailure }, request_id: 'site-anonymous-failure' } })
     })
-    await anonymous.click()
-    await expect(imageCard.getByText(anonymousFailure, { exact: true })).toBeVisible()
-    await expect(anonymous).not.toBeChecked()
+    await failedAnonCheckbox.check()
+    await failedAnonDialog.getByRole('button', { name: '保存服务设置', exact: true }).click()
+    await expect(failedAnonDialog.getByText(anonymousFailure, { exact: true })).toBeVisible()
+    await expect(failedAnonCheckbox).toBeChecked()
     expect((await read<AnonymousSettings>(page, '/api/v1/admin/image-bed/anonymous-settings')).enabled).toBe(false)
     await page.unroute('**/api/v1/admin/image-bed/anonymous-settings')
+    await failedAnonDialog.getByRole('button', { name: '取消', exact: true }).click()
 
     for (const enabled of [true, false, true]) {
+      const anonDialog = await openService(page, '快速图床')
+      const anonymous = anonDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })
       const saved = page.waitForResponse((response) => (
         new URL(response.url()).pathname === '/api/v1/admin/image-bed/anonymous-settings'
         && response.request().method() === 'PUT'
       ))
       await expect(anonymous).toBeChecked({ checked: !enabled })
       await anonymous.click()
+      await saveService(page, anonDialog, 'image_bed', publicSource.key, true)
       expect((await saved).status()).toBe(200)
-      await expect(anonymous).toBeChecked({ checked: enabled })
       const persisted = await read<AnonymousSettings>(page, '/api/v1/admin/image-bed/anonymous-settings')
       expect(persisted.enabled).toBe(enabled)
       expect((await binding(page, 'image_bed')).source_key).toBe(publicSource.key)
     }
 
-    // Retention writes are independent from bindings and the anonymous entry switch.
-    const bindingsBeforeRetention = await bindings(page)
-    await imageCard.getByRole('button', { name: '保留策略', exact: true }).click()
-    const retentionDialog = page.getByRole('dialog', { name: '图片保留策略', exact: true })
-    await expect(retentionDialog).toBeVisible()
+    // Retention writes inside the service modal persist cleanly alongside the service binding.
+    const retentionDialog = await openService(page, '快速图床')
     await retentionDialog.getByRole('spinbutton', { name: '登录用户图片保留天数' }).fill('30')
     await retentionDialog.getByRole('spinbutton', { name: '匿名图片保留天数' }).fill('7')
     const retentionSaved = page.waitForResponse((response) => (
       new URL(response.url()).pathname === '/api/v1/admin/image-bed/retention'
       && response.request().method() === 'PUT'
     ))
-    await retentionDialog.getByRole('button', { name: '保存保留策略', exact: true }).click()
+    await saveService(page, retentionDialog, 'image_bed', publicSource.key, true)
     expect((await retentionSaved).status()).toBe(200)
-    await expect(retentionDialog).toBeHidden()
     expect(await read<Retention>(page, '/api/v1/admin/image-bed/retention')).toMatchObject({ user_retention_days: 30, anonymous_retention_days: 7 })
-    expect(await bindings(page)).toEqual(bindingsBeforeRetention)
     expect((await read<AnonymousSettings>(page, '/api/v1/admin/image-bed/anonymous-settings')).enabled).toBe(true)
-    await imageCard.getByRole('button', { name: '保留策略', exact: true }).click()
-    await expect(retentionDialog.getByRole('spinbutton', { name: '登录用户图片保留天数' })).toHaveValue('30')
-    await expect(retentionDialog.getByRole('spinbutton', { name: '匿名图片保留天数' })).toHaveValue('7')
-    await retentionDialog.getByRole('button', { name: '取消', exact: true }).click()
+    const reopenedRetention = await openService(page, '快速图床')
+    await expect(reopenedRetention.getByRole('spinbutton', { name: '登录用户图片保留天数' })).toHaveValue('30')
+    await expect(reopenedRetention.getByRole('spinbutton', { name: '匿名图片保留天数' })).toHaveValue('7')
+    await reopenedRetention.getByRole('button', { name: '取消', exact: true }).click()
 
     // A disabled carrier cannot be selected; an existing anonymous gate can still be closed.
     await mutate(page, csrf, `/api/v1/admin/sources/${publicSource.key}/disable`, undefined, 'POST')
     await page.reload()
-    await expect(anonymous).toBeEnabled()
-    const disabledGateClosed = page.waitForResponse((response) => response.url().endsWith('/api/v1/admin/image-bed/anonymous-settings') && response.request().method() === 'PUT')
-    await anonymous.uncheck()
-    expect((await disabledGateClosed).status()).toBe(200)
-    await expect(anonymous).toBeDisabled()
-    expect((await read<AnonymousSettings>(page, '/api/v1/admin/image-bed/anonymous-settings')).enabled).toBe(false)
     const disabledSourceDialog = await openService(page, '快速图床')
-    await disabledSourceDialog.getByRole('combobox', { name: '绑定存储源', exact: true }).click()
+    const disabledGateCheckbox = disabledSourceDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })
+    await expect(disabledGateCheckbox).toBeEnabled()
+    const disabledGateClosed = page.waitForResponse((response) => response.url().endsWith('/api/v1/admin/image-bed/anonymous-settings') && response.request().method() === 'PUT')
+    await disabledGateCheckbox.uncheck()
+    await saveService(page, disabledSourceDialog, 'image_bed', publicSource.key, true)
+    expect((await disabledGateClosed).status()).toBe(200)
+    expect((await read<AnonymousSettings>(page, '/api/v1/admin/image-bed/anonymous-settings')).enabled).toBe(false)
+    const checkDisabledDialog = await openService(page, '快速图床')
+    await expect(checkDisabledDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })).toBeDisabled()
+    await checkDisabledDialog.getByRole('combobox', { name: '绑定存储源', exact: true }).click()
     await expect(page.getByRole('option', { name: new RegExp(publicSource.name) })).toHaveAttribute('aria-disabled', 'true')
     await page.keyboard.press('Escape')
-    await disabledSourceDialog.getByRole('button', { name: '取消', exact: true }).click()
+    await checkDisabledDialog.getByRole('button', { name: '取消', exact: true }).click()
     await mutate(page, csrf, `/api/v1/admin/sources/${publicSource.key}/enable`, undefined, 'POST')
     await page.reload()
-    await expect(anonymous).toBeEnabled()
-    await expect(anonymous).not.toBeChecked()
+    const enabledAgainDialog = await openService(page, '快速图床')
+    await expect(enabledAgainDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })).toBeEnabled()
+    await expect(enabledAgainDialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })).not.toBeChecked()
+    await enabledAgainDialog.getByRole('button', { name: '取消', exact: true }).click()
   } finally {
     await page.unroute('**/api/v1/admin/capabilities/image_bed')
     await page.unroute('**/api/v1/admin/image-bed/anonymous-settings')
@@ -360,15 +373,14 @@ test('site navigation groups services and general settings without desktop or mo
       await expect(card).toBeVisible()
       expect(await card.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
       const dialog = await openService(page, service.name)
+      if (service.capability === 'image_bed') {
+        await expect(dialog.getByRole('checkbox', { name: '允许匿名上传', exact: true })).toBeVisible()
+        await expect(dialog.getByRole('spinbutton', { name: '登录用户图片保留天数' })).toBeVisible()
+        await expect(dialog.getByRole('spinbutton', { name: '匿名图片保留天数' })).toBeVisible()
+      }
       await expectNoOverflow(page, dialog)
       await dialog.getByRole('button', { name: '取消', exact: true }).click()
     }
-    await serviceCard(page, '快速图床').getByRole('button', { name: '保留策略', exact: true }).click()
-    const retentionDialog = page.getByRole('dialog', { name: '图片保留策略', exact: true })
-    await expect(retentionDialog.getByRole('spinbutton', { name: '登录用户图片保留天数' })).toBeVisible()
-    await expect(retentionDialog.getByRole('spinbutton', { name: '匿名图片保留天数' })).toBeVisible()
-    await expectNoOverflow(page, retentionDialog)
-    await retentionDialog.getByRole('button', { name: '取消', exact: true }).click()
     if (width === 375) await page.screenshot({ path: '/tmp/omni-site-mobile.png', fullPage: true })
     await generalTab.click()
     for (const heading of ['品牌信息', '运行信息', '导出系统配置包']) {
