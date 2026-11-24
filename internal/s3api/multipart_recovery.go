@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/files"
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
 )
@@ -117,46 +117,14 @@ func (s *MultipartStore) previousObjectState(src *models.StorageSource, objectKe
 	return true, entry.Size, entry.MTime.UnixNano(), nil
 }
 
-func decodeMultipartCompletion(handle io.Reader) (multipartCompletion, error) {
-	var op multipartCompletion
-	decoder := json.NewDecoder(handle)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&op); err != nil {
-		return multipartCompletion{}, err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return multipartCompletion{}, fmt.Errorf("操作日志包含额外 JSON 值")
-		}
-		return multipartCompletion{}, err
-	}
-	return op, nil
-}
-
 func (s *MultipartStore) readMultipartCompletion(uploadID string) (*multipartCompletion, error) {
 	path := s.completionOperationPath(uploadID)
-	info, err := os.Lstat(path)
+	op, err := journal.ReadStrictJSON[multipartCompletion](path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("Multipart 完成操作日志 %s 不是普通文件", filepath.Base(path))
-	}
-	handle, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	op, decodeErr := decodeMultipartCompletion(handle)
-	closeErr := handle.Close()
-	if decodeErr != nil {
-		return nil, fmt.Errorf("读取 Multipart 完成操作日志 %s 失败: %w", filepath.Base(path), decodeErr)
-	}
-	if closeErr != nil {
-		return nil, closeErr
+		return nil, fmt.Errorf("读取 Multipart 完成操作日志 %s 失败: %w", filepath.Base(path), err)
 	}
 	if err := validateMultipartCompletion(op); err != nil {
 		return nil, fmt.Errorf("Multipart 完成操作日志 %s 非法: %w", filepath.Base(path), err)
@@ -168,72 +136,18 @@ func (s *MultipartStore) readMultipartCompletion(uploadID string) (*multipartCom
 }
 
 func syncMultipartDirectory(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return handle.Sync()
+	return journal.SyncDir(dir)
 }
 
 func (s *MultipartStore) writeMultipartCompletion(op multipartCompletion) error {
 	if err := validateMultipartCompletion(op); err != nil {
 		return err
 	}
-	dir := s.completionOperationsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if _, err := os.Lstat(s.completionOperationPath(op.UploadID)); err == nil {
-		return fmt.Errorf("Multipart 完成操作 %s 已存在", op.UploadID)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	temp, err := os.CreateTemp(dir, ".operation-*.tmp")
-	if err != nil {
-		return err
-	}
-	tempPath := temp.Name()
-	keepTemp := true
-	defer func() {
-		_ = temp.Close()
-		if keepTemp {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := json.NewEncoder(temp).Encode(op); err != nil {
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Link(tempPath, s.completionOperationPath(op.UploadID)); err != nil {
-		return err
-	}
-	if err := os.Remove(tempPath); err != nil {
-		return err
-	}
-	keepTemp = false
-	return syncMultipartDirectory(dir)
+	return journal.WriteJSONExclusive(s.completionOperationsDir(), s.completionOperationPath(op.UploadID), op)
 }
 
 func (s *MultipartStore) removeMultipartCompletion(uploadID string) error {
-	dir := s.completionOperationsDir()
-	if err := os.Remove(s.completionOperationPath(uploadID)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return syncMultipartDirectory(dir)
+	return journal.RemoveFiles(s.completionOperationsDir(), s.completionOperationPath(uploadID))
 }
 
 func (s *MultipartStore) multipartCompletionExists(uploadID string) (bool, error) {
@@ -409,16 +323,8 @@ func (s *MultipartStore) completionOperationCount(matches func(multipartCompleti
 	return count, nil
 }
 
-func (s *MultipartStore) cleanupMultipartCompletionTemps(entries []os.DirEntry) error {
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".operation-") || !strings.HasSuffix(entry.Name(), ".tmp") {
-			continue
-		}
-		if err := os.Remove(filepath.Join(s.completionOperationsDir(), entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
+func (s *MultipartStore) cleanupMultipartCompletionTemps(_ []os.DirEntry) error {
+	return journal.CleanOrphans(s.completionOperationsDir())
 }
 
 // RecoverMultipartCompletions 在服务监听前完成或回滚中断的 Multipart 完成操作。

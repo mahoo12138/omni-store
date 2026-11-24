@@ -63,8 +63,21 @@ type Service struct {
 	managedRoots   *managedroot.Service
 	files          *files.Service
 	locks          *locks.Manager
+	lifecycle      *lifecycle.Manager
 	thumbnailLocks *locks.Manager
 	thumbnailSlot  chan struct{}
+}
+
+// SetLifecycle 注入实例级生命周期读写锁管理器。
+func (s *Service) SetLifecycle(mgr *lifecycle.Manager) {
+	s.lifecycle = mgr
+}
+
+func (s *Service) lifecycleManager() *lifecycle.Manager {
+	if s.lifecycle != nil {
+		return s.lifecycle
+	}
+	return lifecycle.Default()
 }
 
 // NewService 创建图床服务。
@@ -163,7 +176,7 @@ func (s *Service) GetAnonymousSettings() (*AnonymousSettings, error) {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	out.Enabled = value == "true"
+	out.Enabled = value == "1" || strings.EqualFold(value, "true")
 	if !out.Enabled {
 		return out, nil
 	}
@@ -276,7 +289,7 @@ func (s *Service) upload(src *models.StorageSource, relDir, originalFilename, ow
 	if ownerUserID != nil {
 		keys = append(keys, lifecycle.User(*ownerUserID))
 	}
-	releaseLifecycle := lifecycle.Read(keys...)
+	releaseLifecycle := s.lifecycleManager().Read(keys...)
 	defer releaseLifecycle()
 	current, err := s.sources.GetByID(src.ID)
 	if err != nil || current.Key != src.Key {
@@ -303,11 +316,11 @@ func (s *Service) upload(src *models.StorageSource, relDir, originalFilename, ow
 	if ownerType != models.ImageOwnerUser {
 		quotaOwnerUserID = nil
 	}
-	quotaGuard, err := s.files.BeginQuotaWriteForUser(src, "", quotaOwnerUserID)
+	// Phase 1（无锁）：乐观上限流式写临时文件并校验真实图片格式，避免慢上传持有配额写锁。
+	optimisticMaxBytes, optimisticLimited, err := s.files.OptimisticQuotaBound(src, "", quotaOwnerUserID)
 	if err != nil {
 		return nil, err
 	}
-	defer quotaGuard.Close()
 
 	// 托管子树整体被系统强制排除，内部布局由图床服务定义，无需排除规则匹配。
 	absDir, err := security.ResolveInSource(src.RootPath, relDir)
@@ -336,10 +349,9 @@ func (s *Service) upload(src *models.StorageSource, relDir, originalFilename, ow
 		return nil, fmt.Errorf("创建临时文件失败: %w", err)
 	}
 	reader := body
-	maxBytes, limited := quotaGuard.MaxBytes()
 	const maxInt64 = int64(^uint64(0) >> 1)
-	if limited && maxBytes < maxInt64 {
-		reader = io.LimitReader(body, maxBytes+1)
+	if optimisticLimited && optimisticMaxBytes < maxInt64 {
+		reader = io.LimitReader(body, optimisticMaxBytes+1)
 	}
 	size, err := io.Copy(tmp, reader)
 	if err == nil {
@@ -352,7 +364,7 @@ func (s *Service) upload(src *models.StorageSource, relDir, originalFilename, ow
 		os.Remove(tmpPath)
 		return nil, fmt.Errorf("写入失败: %w", err)
 	}
-	if limited && size > maxBytes {
+	if optimisticLimited && size > optimisticMaxBytes {
 		os.Remove(tmpPath)
 		return nil, files.ErrQuotaExceeded
 	}
@@ -366,6 +378,18 @@ func (s *Service) upload(src *models.StorageSource, relDir, originalFilename, ow
 	if err != nil {
 		os.Remove(tmpPath)
 		return nil, err
+	}
+
+	// Phase 2（短临界区）：获取配额锁复核精确额度后原子发布与落库。
+	quotaGuard, err := s.files.BeginQuotaWriteForUser(src, "", quotaOwnerUserID)
+	if err != nil {
+		os.Remove(tmpPath)
+		return nil, err
+	}
+	defer quotaGuard.Close()
+	if exactMax, exactLimited := quotaGuard.MaxBytes(); exactLimited && size > exactMax {
+		os.Remove(tmpPath)
+		return nil, files.ErrQuotaExceeded
 	}
 
 	// image_id 与文件名使用不可预测随机数（README §17.9，128-bit）。

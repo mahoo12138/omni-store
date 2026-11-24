@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/models"
 )
 
@@ -36,15 +38,37 @@ type Credential struct {
 	LastUsedAt  *time.Time `json:"last_used_at"`
 }
 
+const credentialTouchThrottle = time.Minute
+
 // Credentials 管理独立于网页登录、WebDAV 和图床 Token 的 S3 Key。
 type Credentials struct {
-	db         *sql.DB
-	dataDir    string
-	configured string
+	db          *sql.DB
+	rdb         *sql.DB
+	dataDir     string
+	configured  string
+	touchMu     sync.Mutex
+	lastTouched map[string]time.Time
 }
 
 func NewCredentials(db *sql.DB, dataDir, configuredMasterKey string) *Credentials {
-	return &Credentials{db: db, dataDir: dataDir, configured: strings.TrimSpace(configuredMasterKey)}
+	return &Credentials{
+		db:          db,
+		dataDir:     dataDir,
+		configured:  strings.TrimSpace(configuredMasterKey),
+		lastTouched: make(map[string]time.Time),
+	}
+}
+
+// SetReadDB 注入只读连接池用于热路径签名凭据解析。
+func (c *Credentials) SetReadDB(rdb *sql.DB) {
+	c.rdb = rdb
+}
+
+func (c *Credentials) readDB() *sql.DB {
+	if c.rdb != nil {
+		return c.rdb
+	}
+	return c.db
 }
 
 func normalizeCredentialName(name string) (string, error) {
@@ -99,7 +123,7 @@ func (c *Credentials) Create(userID int64, name string) (*Credential, string, er
 			}
 			return &Credential{AccessKeyID: accessKeyID, Name: name, CreatedAt: now}, secret, nil
 		}
-		if !strings.Contains(err.Error(), "s3_credentials.access_key_id") {
+		if !db.IsUniqueConstraint(err, "s3_credentials.access_key_id") {
 			return nil, "", fmt.Errorf("创建 S3 凭据失败: %w", err)
 		}
 	}
@@ -153,7 +177,7 @@ func (c *Credentials) Delete(userID int64, accessKeyID string) error {
 
 // Resolve 返回签名校验所需的用户和 Secret。用户或 Key 禁用时统一视为无效凭据。
 func (c *Credentials) Resolve(accessKeyID string) (*models.User, string, error) {
-	row := c.db.QueryRow(`SELECT
+	row := c.readDB().QueryRow(`SELECT
     u.id, u.user_public_id, u.username, u.display_name, u.role, u.is_disabled, u.created_at, u.updated_at,
     c.secret_access_key_encrypted, c.secret_key_nonce, c.is_disabled
   FROM s3_credentials c JOIN users u ON u.id = c.owner_user_id
@@ -185,7 +209,21 @@ func (c *Credentials) Resolve(accessKeyID string) (*models.User, string, error) 
 }
 
 func (c *Credentials) Touch(accessKeyID string) {
-	_, _ = c.db.Exec(`UPDATE s3_credentials SET last_used_at = ? WHERE access_key_id = ?`, time.Now().UTC(), accessKeyID)
+	now := time.Now().UTC()
+	c.touchMu.Lock()
+	if c.lastTouched == nil {
+		c.lastTouched = make(map[string]time.Time)
+	}
+	if prev, ok := c.lastTouched[accessKeyID]; ok && now.Sub(prev) < credentialTouchThrottle {
+		c.touchMu.Unlock()
+		return
+	}
+	if len(c.lastTouched) >= 4096 {
+		clear(c.lastTouched)
+	}
+	c.lastTouched[accessKeyID] = now
+	c.touchMu.Unlock()
+	_, _ = c.db.Exec(`UPDATE s3_credentials SET last_used_at = ? WHERE access_key_id = ?`, now, accessKeyID)
 }
 
 func encryptSecret(key []byte, accessKeyID, secret string) ([]byte, []byte, error) {

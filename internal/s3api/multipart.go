@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/files"
 	"github.com/omni-store/omnistore/internal/lifecycle"
 	"github.com/omni-store/omnistore/internal/locks"
@@ -74,7 +75,20 @@ type MultipartStore struct {
 	files     *files.Service
 	maxObject int64
 	locks     *locks.Manager
+	lifecycle *lifecycle.Manager
 	now       func() time.Time
+}
+
+// SetLifecycle 注入实例级生命周期读写锁管理器。
+func (s *MultipartStore) SetLifecycle(mgr *lifecycle.Manager) {
+	s.lifecycle = mgr
+}
+
+func (s *MultipartStore) lifecycleManager() *lifecycle.Manager {
+	if s.lifecycle != nil {
+		return s.lifecycle
+	}
+	return lifecycle.Default()
 }
 
 func NewMultipartStore(db *sql.DB, dataDir string, fileService *files.Service, maxFileSizeMB int64) *MultipartStore {
@@ -85,7 +99,7 @@ func NewMultipartStore(db *sql.DB, dataDir string, fileService *files.Service, m
 }
 
 func (s *MultipartStore) guardLifecycle(userID, storageSourceID int64) (func(), error) {
-	release := lifecycle.Read(lifecycle.Source(storageSourceID), lifecycle.User(userID))
+	release := s.lifecycleManager().Read(lifecycle.Source(storageSourceID), lifecycle.User(userID))
 	var found int
 	if err := s.db.QueryRow(`SELECT 1 FROM users u, storage_sources source
   WHERE u.id = ? AND source.id = ?`, userID, storageSourceID).Scan(&found); err != nil {
@@ -124,7 +138,7 @@ func (s *MultipartStore) Create(userID, storageSourceID int64, objectKey string)
 			return &MultipartUpload{UploadID: uploadID, OwnerUserID: userID, StorageSourceID: storageSourceID, ObjectKey: objectKey, CreatedAt: now, UpdatedAt: now}, nil
 		}
 		_ = os.RemoveAll(dir)
-		if !strings.Contains(err.Error(), "s3_multipart_uploads.upload_id") {
+		if !db.IsUniqueConstraint(err, "s3_multipart_uploads.upload_id") {
 			return nil, err
 		}
 	}
@@ -416,7 +430,8 @@ func (s *MultipartStore) Complete(userID int64, src *models.StorageSource, objec
 	// RWMutex 在等待写锁时自锁。
 	releaseLifecycle()
 	lifecycleHeld = false
-	if err := s.files.EnsureObjectParents(src, objectKey); err != nil {
+	createdParents, err := s.files.EnsureObjectParentsCreated(src, objectKey)
+	if err != nil {
 		_ = s.removeMultipartCompletion(uploadID)
 		return "", 0, err
 	}
@@ -430,6 +445,7 @@ func (s *MultipartStore) Complete(userID int64, src *models.StorageSource, objec
 		if completed {
 			return etag, total, nil
 		}
+		s.files.CleanupEmptyDirs(src, createdParents)
 		if recoveryErr != nil {
 			return "", 0, errors.Join(err, recoveryErr)
 		}

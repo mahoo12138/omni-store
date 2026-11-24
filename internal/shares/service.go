@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/omni-store/omnistore/internal/auth"
+	"github.com/omni-store/omnistore/internal/db"
 	"github.com/omni-store/omnistore/internal/files"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
@@ -109,11 +110,14 @@ type unlockLimiter struct {
 }
 
 type Service struct {
-	db        *sql.DB
-	sources   *sources.Service
-	files     *files.Service
-	publicURL string
-	limiter   unlockLimiter
+	db              *sql.DB
+	rdb             *sql.DB
+	sources         *sources.Service
+	files           *files.Service
+	publicURL       string
+	limiter         unlockLimiter
+	sessionSweepMu  sync.Mutex
+	lastSessionSweep time.Time
 }
 
 func NewService(db *sql.DB, srcSvc *sources.Service, fileSvc *files.Service, publicURL string) *Service {
@@ -121,6 +125,18 @@ func NewService(db *sql.DB, srcSvc *sources.Service, fileSvc *files.Service, pub
 		db: db, sources: srcSvc, files: fileSvc, publicURL: strings.TrimRight(publicURL, "/"),
 		limiter: newUnlockLimiter(unlockWindow, unlockMaxPerShare, unlockMaxPerIP, unlockMaxTrackedKeys),
 	}
+}
+
+// SetReadDB 注入只读连接池用于热路径分享查询。
+func (s *Service) SetReadDB(rdb *sql.DB) {
+	s.rdb = rdb
+}
+
+func (s *Service) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
 }
 
 func (s *Service) Create(user *models.User, input CreateInput) (*Share, error) {
@@ -177,7 +193,7 @@ func (s *Service) Create(user *models.User, input CreateInput) (*Share, error) {
    expires_at, max_downloads, download_count, created_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`, key, src.ID, relPath, entry.Type, user.ID,
 			passwordHash, input.ExpiresAt, input.MaxDownloads, now)
-		if err == nil || !strings.Contains(err.Error(), "file_shares.share_key") {
+		if err == nil || !db.IsUniqueConstraint(err, "file_shares.share_key") {
 			break
 		}
 	}
@@ -409,9 +425,17 @@ func (s *Service) validSession(shareID int64, token string) (bool, error) {
 		return false, nil
 	}
 	now := time.Now().UTC()
-	_, _ = s.db.Exec(`DELETE FROM share_access_sessions WHERE expires_at <= ?`, now)
+	s.sessionSweepMu.Lock()
+	shouldSweep := s.lastSessionSweep.IsZero() || now.Sub(s.lastSessionSweep) >= time.Minute
+	if shouldSweep {
+		s.lastSessionSweep = now
+	}
+	s.sessionSweepMu.Unlock()
+	if shouldSweep {
+		_, _ = s.db.Exec(`DELETE FROM share_access_sessions WHERE expires_at <= ?`, now)
+	}
 	var found int
-	err := s.db.QueryRow(`SELECT 1 FROM share_access_sessions WHERE share_id = ? AND token_hash = ? AND expires_at > ?`,
+	err := s.readDB().QueryRow(`SELECT 1 FROM share_access_sessions WHERE share_id = ? AND token_hash = ? AND expires_at > ?`,
 		shareID, auth.HashToken(token), now).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil

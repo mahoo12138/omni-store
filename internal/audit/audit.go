@@ -50,6 +50,7 @@ type Entry struct {
 // Logger 写审计日志并维护保留上限。
 type Logger struct {
 	db         *sql.DB
+	rdb        *sql.DB
 	enabled    bool
 	maxEntries int
 	slog       *slog.Logger
@@ -58,6 +59,58 @@ type Logger struct {
 // New 创建审计日志器。maxEntries = 0 表示不限制。
 func New(db *sql.DB, enabled bool, maxEntries int, logger *slog.Logger) *Logger {
 	return &Logger{db: db, enabled: enabled, maxEntries: maxEntries, slog: logger}
+}
+
+// SetReadDB 注入只读连接池供审计查询与用户活动查询使用。
+func (l *Logger) SetReadDB(rdb *sql.DB) {
+	l.rdb = rdb
+}
+
+func (l *Logger) readDB() *sql.DB {
+	if l.rdb != nil {
+		return l.rdb
+	}
+	return l.db
+}
+
+// UserActivityEntry 表示个人仪表盘展示的一条高阶用户活动。
+type UserActivityEntry struct {
+	ID           int64
+	Action       string
+	RelativePath string
+	SourceName   string
+	CreatedAt    string
+}
+
+// UserActivity 返回指定用户最近的高阶操作事件（排除 login/password 类杂项）。
+func (l *Logger) UserActivity(userID int64, limit int) ([]UserActivityEntry, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 8
+	}
+	rows, err := l.readDB().Query(`SELECT a.id, a.action, a.relative_path, a.created_at,
+       COALESCE(s.name, '') AS source_name
+  FROM audit_logs a
+  LEFT JOIN storage_sources s ON s.id = a.storage_source_id
+  WHERE a.actor_type = 'user' AND a.actor_user_id = ?
+    AND a.action NOT IN ('login_success', 'login_failed', 'change_password')
+  ORDER BY a.id DESC LIMIT ?`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]UserActivityEntry, 0, limit)
+	for rows.Next() {
+		var item UserActivityEntry
+		var rel *string
+		if err := rows.Scan(&item.ID, &item.Action, &rel, &item.CreatedAt, &item.SourceName); err != nil {
+			return nil, err
+		}
+		if rel != nil {
+			item.RelativePath = *rel
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 // Log 写入一条审计记录。审计失败只记录应用日志，不影响业务。
@@ -163,14 +216,14 @@ func (l *Logger) Query(opts QueryOptions) ([]*LogEntry, int64, error) {
 
 	whereSQL := strings.Join(where, " AND ")
 	var total int64
-	if err := l.db.QueryRow(`SELECT COUNT(*) FROM audit_logs a
+	if err := l.readDB().QueryRow(`SELECT COUNT(*) FROM audit_logs a
   LEFT JOIN storage_sources s ON s.id = a.storage_source_id WHERE `+whereSQL, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
 	queryArgs := append([]any{}, args...)
 	queryArgs = append(queryArgs, opts.PageSize, (opts.Page-1)*opts.PageSize)
-	rows, err := l.db.Query(`SELECT
+	rows, err := l.readDB().Query(`SELECT
     a.id, a.actor_type, a.actor_user_id, a.entry_type, a.action, a.storage_source_id, s.name,
     a.relative_path, a.target_relative_path, a.ip_address, a.user_agent, a.status, a.error_code, a.created_at
   FROM audit_logs a LEFT JOIN storage_sources s ON s.id = a.storage_source_id

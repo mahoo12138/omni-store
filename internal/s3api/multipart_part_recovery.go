@@ -2,10 +2,8 @@ package s3api
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -14,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/security"
 )
 
@@ -96,103 +95,21 @@ func (s *MultipartStore) newMultipartPartOperation(upload MultipartUpload, partN
 	return op
 }
 
-func decodeMultipartPartOperation(reader io.Reader) (multipartPartOperation, error) {
-	var op multipartPartOperation
-	decoder := json.NewDecoder(reader)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&op); err != nil {
-		return multipartPartOperation{}, err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return multipartPartOperation{}, fmt.Errorf("操作日志包含额外 JSON 值")
-		}
-		return multipartPartOperation{}, err
-	}
-	return op, nil
-}
-
 func (s *MultipartStore) writeMultipartPartOperation(op multipartPartOperation) error {
 	if err := validateMultipartPartOperation(op); err != nil {
 		return err
 	}
-	dir := s.partOperationsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	path := s.partOperationPath(op.UploadID, op.PartNumber)
-	if _, err := os.Lstat(path); err == nil {
-		return fmt.Errorf("Multipart 分片操作 %s 尚未恢复", multipartPartOperationName(op.UploadID, op.PartNumber))
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	temp, err := os.CreateTemp(dir, ".operation-*.tmp")
-	if err != nil {
-		return err
-	}
-	tempPath := temp.Name()
-	keepTemp := true
-	defer func() {
-		_ = temp.Close()
-		if keepTemp {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := json.NewEncoder(temp).Encode(op); err != nil {
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Link(tempPath, path); err != nil {
-		return err
-	}
-	if err := os.Remove(tempPath); err != nil {
-		return err
-	}
-	keepTemp = false
-	return syncMultipartDirectory(dir)
+	return journal.WriteJSONExclusive(s.partOperationsDir(), s.partOperationPath(op.UploadID, op.PartNumber), op)
 }
 
 func (s *MultipartStore) removeMultipartPartOperation(uploadID string, partNumber int) error {
-	dir := s.partOperationsDir()
-	if err := os.Remove(s.partOperationPath(uploadID, partNumber)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return syncMultipartDirectory(dir)
+	return journal.RemoveFiles(s.partOperationsDir(), s.partOperationPath(uploadID, partNumber))
 }
 
 func (s *MultipartStore) readMultipartPartOperation(path string) (multipartPartOperation, error) {
-	info, err := os.Lstat(path)
+	op, err := journal.ReadStrictJSON[multipartPartOperation](path)
 	if err != nil {
-		return multipartPartOperation{}, err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return multipartPartOperation{}, fmt.Errorf("Multipart 分片操作日志 %s 不是普通文件", filepath.Base(path))
-	}
-	handle, err := os.Open(path)
-	if err != nil {
-		return multipartPartOperation{}, err
-	}
-	op, decodeErr := decodeMultipartPartOperation(handle)
-	closeErr := handle.Close()
-	if decodeErr != nil {
-		return multipartPartOperation{}, fmt.Errorf("读取 Multipart 分片操作日志 %s 失败: %w", filepath.Base(path), decodeErr)
-	}
-	if closeErr != nil {
-		return multipartPartOperation{}, closeErr
+		return multipartPartOperation{}, fmt.Errorf("读取 Multipart 分片操作日志 %s 失败: %w", filepath.Base(path), err)
 	}
 	if err := validateMultipartPartOperation(op); err != nil {
 		return multipartPartOperation{}, fmt.Errorf("Multipart 分片操作日志 %s 非法: %w", filepath.Base(path), err)
@@ -550,21 +467,8 @@ func (s *MultipartStore) partOperationCount(matches func(multipartPartOperation)
 	return count, nil
 }
 
-func (s *MultipartStore) cleanupMultipartPartOperationTemps(entries []os.DirEntry) error {
-	removed := false
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".operation-") || !strings.HasSuffix(entry.Name(), ".tmp") {
-			continue
-		}
-		if err := os.Remove(filepath.Join(s.partOperationsDir(), entry.Name())); err != nil {
-			return err
-		}
-		removed = true
-	}
-	if removed {
-		return syncMultipartDirectory(s.partOperationsDir())
-	}
-	return nil
+func (s *MultipartStore) cleanupMultipartPartOperationTemps(_ []os.DirEntry) error {
+	return journal.CleanOrphans(s.partOperationsDir())
 }
 
 // RecoverMultipartPartOperations 在监听服务前恢复中断的 UploadPart 文件替换。

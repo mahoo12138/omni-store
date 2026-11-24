@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/omni-store/omnistore/internal/models"
 )
@@ -235,12 +234,28 @@ func validateSignedHeaders(r *http.Request, signedHeaders []string) error {
 	return nil
 }
 
+// canonicalURI 基于原始转义路径（EscapedPath / RawPath）逐段归一化编码，
+// 保持 %2F 与真实路径分隔符 / 的语义区分，符合 AWS Signature V4 规范。
 func canonicalURI(u *url.URL) string {
-	path := u.Path
-	if path == "" {
-		path = "/"
+	raw := u.EscapedPath()
+	if raw == "" {
+		return "/"
 	}
-	return awsEncode(path, true)
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	segments := strings.Split(raw, "/")
+	for i, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		if decoded, err := url.PathUnescape(seg); err == nil {
+			segments[i] = awsEncode(decoded, false)
+		} else {
+			segments[i] = awsEncode(seg, false)
+		}
+	}
+	return strings.Join(segments, "/")
 }
 
 func canonicalQuery(values url.Values, omitSignature bool) string {
@@ -273,22 +288,17 @@ func canonicalQuery(values url.Values, omitSignature bool) string {
 func awsEncode(value string, preserveSlash bool) string {
 	const hexChars = "0123456789ABCDEF"
 	var out strings.Builder
-	for len(value) > 0 {
-		r, size := utf8.DecodeRuneInString(value)
-		if r == utf8.RuneError && size == 1 {
-			r = rune(value[0])
+	out.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
+			b == '-' || b == '_' || b == '.' || b == '~' || (preserveSlash && b == '/') {
+			out.WriteByte(b)
+		} else {
+			out.WriteByte('%')
+			out.WriteByte(hexChars[b>>4])
+			out.WriteByte(hexChars[b&15])
 		}
-		chunk := []byte(string(r))
-		for _, b := range chunk {
-			if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || strings.ContainsRune("-_.~", rune(b)) || (preserveSlash && b == '/') {
-				out.WriteByte(b)
-			} else {
-				out.WriteByte('%')
-				out.WriteByte(hexChars[b>>4])
-				out.WriteByte(hexChars[b&15])
-			}
-		}
-		value = value[size:]
 	}
 	return out.String()
 }

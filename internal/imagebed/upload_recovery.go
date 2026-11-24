@@ -3,7 +3,6 @@ package imagebed
 import (
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/omni-store/omnistore/internal/auth"
 	"github.com/omni-store/omnistore/internal/files"
+	"github.com/omni-store/omnistore/internal/journal"
 	"github.com/omni-store/omnistore/internal/models"
 	"github.com/omni-store/omnistore/internal/security"
 )
@@ -212,65 +212,18 @@ func (s *Service) writePreparedImageUploadOperation(op imageUploadOperation) err
 }
 
 func (s *Service) writeImageUploadOperationFile(target string, op imageUploadOperation) error {
-	dir := s.uploadOperationsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("创建图床上传日志目录失败: %w", err)
-	}
-	if _, err := os.Lstat(target); err == nil {
-		return fmt.Errorf("图床上传 %s 尚未恢复", op.OperationID)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	temp, err := os.CreateTemp(dir, ".operation-*.tmp")
-	if err != nil {
-		return fmt.Errorf("创建图床上传日志失败: %w", err)
-	}
-	tempPath := temp.Name()
-	keepTemp := true
-	defer func() {
-		_ = temp.Close()
-		if keepTemp {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := json.NewEncoder(temp).Encode(op); err != nil {
-		return fmt.Errorf("写入图床上传日志失败: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("同步图床上传日志失败: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("关闭图床上传日志失败: %w", err)
-	}
-	if err := os.Link(tempPath, target); err != nil {
-		return fmt.Errorf("提交图床上传日志失败: %w", err)
-	}
-	if err := os.Remove(tempPath); err != nil {
-		return fmt.Errorf("清理图床上传临时日志失败: %w", err)
-	}
-	keepTemp = false
-	return syncImageDirectory(dir)
+	return journal.WriteJSONExclusive(s.uploadOperationsDir(), target, op)
 }
 
 func (s *Service) removeImageUploadOperation(operationID string) error {
-	for _, item := range []string{s.uploadOperationPath(operationID), s.uploadPreparedPath(operationID)} {
-		if err := os.Remove(item); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-	}
-	return syncImageDirectory(s.uploadOperationsDir())
+	return journal.RemoveFiles(s.uploadOperationsDir(),
+		s.uploadOperationPath(operationID),
+		s.uploadPreparedPath(operationID),
+	)
 }
 
 func syncImageDirectory(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return handle.Sync()
+	return journal.SyncDir(dir)
 }
 
 func (s *Service) rollbackUncommittedImageUpload(op imageUploadOperation, absPath string) error {
@@ -307,6 +260,9 @@ func (s *Service) commitImageUpload(op imageUploadOperation, prepared *files.Pre
 	if err := s.files.RecordPreparedFileTx(tx, prepared); err != nil {
 		return 0, err
 	}
+	if err := s.files.AdjustSourceUsageTx(tx, op.StorageSourceID, op.Size); err != nil {
+		return 0, err
+	}
 	rowID, err := res.LastInsertId()
 	if err != nil {
 		return 0, err
@@ -318,20 +274,7 @@ func (s *Service) commitImageUpload(op imageUploadOperation, prepared *files.Pre
 }
 
 func decodeImageUploadOperation(handle io.Reader) (imageUploadOperation, error) {
-	var op imageUploadOperation
-	decoder := json.NewDecoder(handle)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&op); err != nil {
-		return imageUploadOperation{}, err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return imageUploadOperation{}, fmt.Errorf("操作日志包含额外 JSON 值")
-		}
-		return imageUploadOperation{}, err
-	}
-	return op, nil
+	return journal.DecodeStrictJSON[imageUploadOperation](handle)
 }
 
 func (s *Service) committedImageUpload(op imageUploadOperation) (bool, error) {
@@ -444,22 +387,8 @@ func (s *Service) RecoverUploadOperations() (UploadRecoveryResult, error) {
 	if err != nil {
 		return result, err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), ".operation-") && strings.HasSuffix(entry.Name(), ".tmp") {
-			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-				return result, fmt.Errorf("清理未提交的图床上传临时日志 %s 失败: %w", entry.Name(), err)
-			}
-		}
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".prepared") {
-			operationID := strings.TrimSuffix(entry.Name(), ".prepared")
-			if _, err := os.Stat(s.uploadOperationPath(operationID)); errors.Is(err, fs.ErrNotExist) {
-				if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return result, err
-				}
-			} else if err != nil {
-				return result, err
-			}
-		}
+	if err := journal.CleanOrphans(dir, ".prepared"); err != nil {
+		return result, err
 	}
 	entries, err = os.ReadDir(dir)
 	if err != nil {

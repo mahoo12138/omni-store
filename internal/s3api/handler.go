@@ -443,7 +443,8 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, authenticate
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if err := h.files.EnsureObjectParents(src, key); err != nil {
+	createdParents, err := h.files.EnsureObjectParentsCreated(src, key)
+	if err != nil {
 		h.writeFileError(w, r, err, key)
 		return
 	}
@@ -453,6 +454,7 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, authenticate
 		var err error
 		chunked, err = newAWSChunkedReader(r.Body, r.Header.Get("X-Amz-Decoded-Content-Length"), r.Header.Get("X-Amz-Trailer"))
 		if err != nil {
+			h.files.CleanupEmptyDirs(src, createdParents)
 			h.writeError(w, r, http.StatusBadRequest, "InvalidRequest", err.Error(), key)
 			return
 		}
@@ -468,9 +470,11 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, authenticate
 	body = io.TeeReader(body, md5Hash)
 	dir, filename := path.Split(key)
 	dir = strings.TrimSuffix(dir, "/")
-	_, _, err := h.files.UploadWithLockTokens(src, dir, filename, body, true, nil, &authenticated.User.ID)
+	_, _, err = h.files.UploadWithLockTokens(src, dir, filename, body, true, nil, &authenticated.User.ID)
 	if err != nil {
-		if strings.Contains(err.Error(), "request body too large") {
+		h.files.CleanupEmptyDirs(src, createdParents)
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
 			h.writeError(w, r, http.StatusRequestEntityTooLarge, "EntityTooLarge", "对象超过上传大小限制", key)
 			return
 		}

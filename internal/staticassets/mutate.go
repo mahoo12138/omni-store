@@ -18,6 +18,7 @@ import (
 type ConfigureInput struct {
 	SourceKey          string
 	PublishRoot        string
+	Enabled            *bool
 	CacheMode          string
 	CorsMode           string
 	PublicOrigin       string
@@ -79,9 +80,6 @@ func (s *Service) Configure(in ConfigureInput, actorUserID *int64, auditLogger *
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPublishRootInvalid, err)
 	}
-	if src.IsDisabled {
-		return nil, fmt.Errorf("%w: 存储源已禁用", ErrPublishRootInvalid)
-	}
 	root, err := normalizePublishRoot(in.PublishRoot)
 	if err != nil {
 		return nil, err
@@ -111,6 +109,10 @@ func (s *Service) Configure(in ConfigureInput, actorUserID *int64, auditLogger *
 	}
 	assetID := GenerateAssetID()
 
+	enabled := true
+	if in.Enabled != nil {
+		enabled = *in.Enabled
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -119,7 +121,7 @@ func (s *Service) Configure(in ConfigureInput, actorUserID *int64, auditLogger *
 	now := time.Now().UTC()
 	if _, err := tx.Exec(`INSERT INTO source_static_access
  (storage_source_id, enabled, publish_root, public_asset_id, public_origin, cache_mode, cors_mode, revision, updated_at)
- VALUES (?, 1, ?, ?, ?, ?, ?, 1, ?)`, src.ID, root, assetID, origin, in.CacheMode, in.CorsMode, now); err != nil {
+ VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`, src.ID, enabled, root, assetID, origin, in.CacheMode, in.CorsMode, now); err != nil {
 		return nil, err
 	}
 	if err := replaceOrigins(tx, src.ID, origins); err != nil {
